@@ -45,8 +45,18 @@ codemem/
 web/           giao diện chat
 ```
 
+## Tính năng
+
+- Index JS/TS/TSX/C# (tree-sitter, tăng dần theo hash)
+- Hỏi đáp RAG: ghép **ngữ cảnh codebase** + **brain 14k bài học** vào câu trả lời
+- **Call graph**: ai gọi ai (nút liên quan trong câu trả lời, API `/api/related/{name}`)
+- **Route API**: tự trích endpoint Express / ASP.NET (nút **Routes**, API `/api/routes`)
+- **Tag** FE / BE / event cho symbol
+- **Auto re-index**: theo dõi file project, đổi là cập nhật (watchdog)
+- **Xoá index** + tự dọn khi đổi project (tránh phình DB)
+
 ## Roadmap
 
-- **Phase 1 (hiện tại):** index file/symbol + chat RAG.
-- **Phase 2:** call graph, trích route API, tag FE/BE/event, auto re-index.
-- **Phase 3:** LLM tóm tắt "tác dụng", project map, context pack thông minh.
+- **Phase 1 ✅:** index file/symbol + chat RAG.
+- **Phase 2 ✅:** call graph, trích route API, tag FE/BE/event, auto re-index.
+- **Phase 3:** LLM tóm tắt "tác dụng", project map, context pack thông minh, đóng gói 1-click + icon.

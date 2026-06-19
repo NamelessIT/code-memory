@@ -68,6 +68,23 @@ def build_context(query: str):
         if c["file_path"] not in files_order:
             files_order.append(c["file_path"])
 
+    # Call graph cho vai symbol dau (ai goi / goi ai)
+    cg = ["\n=== CALL GRAPH (LIEN QUAN) ==="]
+    for c in cands[:3]:
+        nm = c["name"]
+        if not nm:
+            continue
+        callees = db.get_callees(nm, limit=8)
+        callers = db.get_callers(nm, limit=8)
+        if callees or callers:
+            cg.append(f"{nm}:")
+            if callees:
+                cg.append(f"  goi -> {', '.join(callees)}")
+            if callers:
+                cg.append(f"  duoc goi boi <- {', '.join(callers)}")
+    if len(cg) > 1:
+        lines.extend(cg)
+
     # Skeleton cac file lien quan, cat theo budget
     text = "\n".join(lines)
     used = []
@@ -85,3 +102,13 @@ def build_context(query: str):
         text += "\n" + "\n\n".join(sk_parts)
 
     return text, used
+
+
+def get_related(name: str):
+    """Thong tin call-graph cua 1 symbol (cho endpoint /api/related)."""
+    return {
+        "name": name,
+        "definitions": db.get_symbols_by_name(name, limit=10),
+        "calls": db.get_callees(name, limit=30),
+        "called_by": db.get_callers(name, limit=30),
+    }

@@ -32,17 +32,41 @@ def init_db():
             end_line INTEGER,
             parent TEXT,
             exported INTEGER DEFAULT 0,
+            tag TEXT DEFAULT '',
             FOREIGN KEY (file_path) REFERENCES files(path)
         );
         CREATE INDEX IF NOT EXISTS idx_sym_name ON symbols(name);
         CREATE INDEX IF NOT EXISTS idx_sym_file ON symbols(file_path);
         CREATE INDEX IF NOT EXISTS idx_sym_kind ON symbols(kind);
 
+        CREATE TABLE IF NOT EXISTS edges (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_path TEXT NOT NULL,
+            caller TEXT,
+            callee TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_edge_caller ON edges(caller);
+        CREATE INDEX IF NOT EXISTS idx_edge_callee ON edges(callee);
+
+        CREATE TABLE IF NOT EXISTS routes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_path TEXT NOT NULL,
+            method TEXT,
+            path TEXT,
+            handler TEXT,
+            line INTEGER
+        );
+
         CREATE TABLE IF NOT EXISTS meta (
             key TEXT PRIMARY KEY,
             value TEXT
         );
     """)
+    # Migration: them cot tag cho DB cu
+    try:
+        conn.execute("ALTER TABLE symbols ADD COLUMN tag TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
 
@@ -55,8 +79,8 @@ def get_indexed_hashes() -> dict:
     return {r["path"]: r["hash"] for r in rows}
 
 
-def upsert_file(path, lang, file_hash, skeleton, symbols):
-    """Ghi file + thay toan bo symbol cua file (xoa cu, them moi)."""
+def upsert_file(path, lang, file_hash, skeleton, symbols, edges=None, routes=None):
+    """Ghi file + thay toan bo symbol/edge/route cua file (xoa cu, them moi)."""
     conn = _conn()
     now = datetime.now().isoformat()
     conn.execute(
@@ -66,14 +90,26 @@ def upsert_file(path, lang, file_hash, skeleton, symbols):
     )
     conn.execute("DELETE FROM symbols WHERE file_path=?", (path,))
     conn.executemany(
-        "INSERT INTO symbols(file_path, kind, name, signature, start_line, end_line, parent, exported) "
-        "VALUES (?,?,?,?,?,?,?,?)",
+        "INSERT INTO symbols(file_path, kind, name, signature, start_line, end_line, parent, exported, tag) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
         [
             (path, s["kind"], s["name"], s["signature"], s["start_line"],
-             s["end_line"], s.get("parent"), 1 if s.get("exported") else 0)
+             s["end_line"], s.get("parent"), 1 if s.get("exported") else 0, s.get("tag", ""))
             for s in symbols
         ],
     )
+    conn.execute("DELETE FROM edges WHERE file_path=?", (path,))
+    if edges:
+        conn.executemany(
+            "INSERT INTO edges(file_path, caller, callee) VALUES (?,?,?)",
+            [(path, e["caller"], e["callee"]) for e in edges],
+        )
+    conn.execute("DELETE FROM routes WHERE file_path=?", (path,))
+    if routes:
+        conn.executemany(
+            "INSERT INTO routes(file_path, method, path, handler, line) VALUES (?,?,?,?,?)",
+            [(path, r["method"], r["path"], r.get("handler", ""), r.get("line")) for r in routes],
+        )
     conn.commit()
     conn.close()
 
@@ -81,6 +117,8 @@ def upsert_file(path, lang, file_hash, skeleton, symbols):
 def delete_file(path):
     conn = _conn()
     conn.execute("DELETE FROM symbols WHERE file_path=?", (path,))
+    conn.execute("DELETE FROM edges WHERE file_path=?", (path,))
+    conn.execute("DELETE FROM routes WHERE file_path=?", (path,))
     conn.execute("DELETE FROM files WHERE path=?", (path,))
     conn.commit()
     conn.close()
@@ -164,10 +202,43 @@ def get_structure(limit=400):
     return [dict(r) for r in rows]
 
 
+def get_callees(name, limit=15):
+    """Cac ham ma 'name' goi."""
+    conn = _conn()
+    rows = conn.execute(
+        "SELECT DISTINCT callee FROM edges WHERE caller=? LIMIT ?", (name, limit)
+    ).fetchall()
+    conn.close()
+    return [r["callee"] for r in rows]
+
+
+def get_callers(name, limit=15):
+    """Cac ham goi den 'name'."""
+    conn = _conn()
+    rows = conn.execute(
+        "SELECT DISTINCT caller FROM edges WHERE callee=? LIMIT ?", (name, limit)
+    ).fetchall()
+    conn.close()
+    return [r["caller"] for r in rows]
+
+
+def get_routes(limit=300):
+    conn = _conn()
+    rows = conn.execute(
+        "SELECT method, path, handler, file_path, line FROM routes ORDER BY path LIMIT ?",
+        (limit,),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
 def clear_all():
-    """Xoa toan bo index (file + symbol + meta) khoi SQLite."""
+    """Xoa toan bo index (file + symbol + edge + route + meta) khoi SQLite."""
+    init_db()  # dam bao bang ton tai
     conn = _conn()
     conn.execute("DELETE FROM symbols")
+    conn.execute("DELETE FROM edges")
+    conn.execute("DELETE FROM routes")
     conn.execute("DELETE FROM files")
     conn.execute("DELETE FROM meta")
     conn.commit()

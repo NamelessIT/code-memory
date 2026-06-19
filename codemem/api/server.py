@@ -9,7 +9,8 @@ from pydantic import BaseModel
 from ..config import WEB_DIR, HOST, PORT
 from ..storage import db, vectors
 from ..indexer.runner import index_project
-from ..retrieval.search import build_context
+from ..indexer.watcher import manager as watcher
+from ..retrieval.search import build_context, get_related
 from ..chat.agent import ChatSession
 
 app = FastAPI(title="code-memory")
@@ -36,6 +37,7 @@ def do_index(body: IndexBody):
     if not os.path.isdir(body.path):
         return JSONResponse({"error": f"Khong tim thay thu muc: {body.path}"}, status_code=400)
     stats = index_project(body.path)
+    watcher.start(stats["project_root"])  # tu dong theo doi project nay
     return stats
 
 
@@ -48,6 +50,16 @@ def search(q: str):
 @app.get("/api/structure")
 def structure():
     return {"files": db.get_structure()}
+
+
+@app.get("/api/routes")
+def routes():
+    return {"routes": db.get_routes()}
+
+
+@app.get("/api/related/{name}")
+def related(name: str):
+    return get_related(name)
 
 
 @app.get("/api/symbol/{name}")
@@ -93,6 +105,10 @@ app.mount("/", StaticFiles(directory=str(WEB_DIR), html=True), name="web")
 def main():
     import uvicorn
     db.init_db()
+    # Neu da tung index project -> bat watcher tu dong
+    root = db.get_status().get("project_root")
+    if root:
+        watcher.start(root)
     print(f"code-memory chay tai http://{HOST}:{PORT}")
     uvicorn.run(app, host=HOST, port=PORT)
 

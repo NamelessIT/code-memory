@@ -8,21 +8,36 @@
 </head>
 <body>
   <header>
-    <div class="brand">🧠 code-memory</div>
-    <div class="status" id="status">Đang tải...</div>
-    <div class="project">
-      <input id="projectPath" type="text" placeholder="Đường dẫn project (vd: C:\path\to\repo)" />
-      <button id="indexBtn">Index</button>
-      <button id="clearBtn" title="Xoá toàn bộ index codebase">Xoá index</button>
-      <button id="resetBtn" title="Xoá lịch sử chat">Reset</button>
+    <div class="bar-top">
+      <div class="brand"><span class="logo">🧠</span> code&#8209;memory <span class="badge" id="modelBadge">agent-7b-v2</span></div>
+      <div class="status-pill" id="status">Đang tải…</div>
+    </div>
+    <div class="bar-tools">
+      <input id="projectPath" type="text" placeholder="Dán đường dẫn project rồi bấm Index  (vd: C:\Github\…\my-app)" />
+      <button id="indexBtn" class="tip primary" data-tip="Quét codebase: trích hàm, class, route, call graph rồi lưu để hỏi đáp">Index</button>
+      <button id="routesBtn" class="tip ghost" data-tip="Liệt kê các API endpoint (route) đã tìm thấy">Routes</button>
+      <button id="clearBtn" class="tip ghost" data-tip="Xoá toàn bộ index codebase (SQLite + vector). Không xoá lịch sử chat">Xoá index</button>
+      <button id="resetBtn" class="tip ghost" data-tip="Xoá lịch sử cuộc trò chuyện hiện tại">Reset chat</button>
     </div>
   </header>
 
-  <main id="chat"></main>
+  <main id="chat">
+    <div class="welcome" id="welcome">
+      <h2>👋 Hỏi gì về codebase cũng được</h2>
+      <p>Index một project rồi hỏi tự nhiên. Ví dụ:</p>
+      <div class="examples">
+        <span class="chip" data-q="Luồng đăng nhập chạy như thế nào?">Luồng đăng nhập chạy thế nào?</span>
+        <span class="chip" data-q="Hàm nào gọi tới hàm loadUser?">Hàm nào gọi tới loadUser?</span>
+        <span class="chip" data-q="Có những API endpoint nào?">Có những API endpoint nào?</span>
+        <span class="chip" data-q="Giải thích cấu trúc thư mục dự án">Giải thích cấu trúc dự án</span>
+      </div>
+      <p class="muted">Chưa index vẫn chat được — agent có sẵn brain 14k bài học.</p>
+    </div>
+  </main>
 
   <footer>
-    <textarea id="input" rows="1" placeholder="Hỏi về codebase... (Enter để gửi, Shift+Enter xuống dòng)"></textarea>
-    <button id="sendBtn">Gửi</button>
+    <textarea id="input" rows="1" placeholder="Hỏi về codebase…  (Enter để gửi · Shift+Enter xuống dòng)"></textarea>
+    <button id="sendBtn" class="primary tip" data-tip="Gửi câu hỏi">➤</button>
   </footer>
 
   <script src="/app.js"></script>
