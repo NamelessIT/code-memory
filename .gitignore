@@ -1,0 +1,13 @@
+# Data (index, vectors)
+data/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# OS
+Thumbs.db
+.DS_Store

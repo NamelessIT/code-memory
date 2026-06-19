@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>code-memory</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header>
+    <div class="brand">🧠 code-memory</div>
+    <div class="status" id="status">Đang tải...</div>
+    <div class="project">
+      <input id="projectPath" type="text" placeholder="Đường dẫn project (vd: C:\path\to\repo)" />
+      <button id="indexBtn">Index</button>
+      <button id="clearBtn" title="Xoá toàn bộ index codebase">Xoá index</button>
+      <button id="resetBtn" title="Xoá lịch sử chat">Reset</button>
+    </div>
+  </header>
+
+  <main id="chat"></main>
+
+  <footer>
+    <textarea id="input" rows="1" placeholder="Hỏi về codebase... (Enter để gửi, Shift+Enter xuống dòng)"></textarea>
+    <button id="sendBtn">Gửi</button>
+  </footer>
+
+  <script src="/app.js"></script>
+</body>
+</html>
