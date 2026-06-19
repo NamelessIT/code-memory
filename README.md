@@ -23,7 +23,12 @@ pip install -r requirements.txt
 
 ## Chạy
 
-- **Cách 1:** double-click `scripts\start_hidden.vbs` → tự mở trình duyệt, không hiện cửa sổ console.
+- **Cách 0 (khuyên):** chạy 1 lần để tạo icon trên Desktop:
+  ```powershell
+  powershell -ExecutionPolicy Bypass -File scripts\install_shortcut.ps1
+  ```
+  (thêm `-AutoStart` để chạy cùng Windows). Sau đó **double-click icon "code-memory"** trên Desktop là xong.
+- **Cách 1:** double-click `scripts\start_hidden.vbs` → tự mở trình duyệt, không hiện console.
 - **Cách 2:** double-click `scripts\start.bat`.
 - **Cách 3 (thủ công):** `python -m codemem.api.server` rồi mở http://127.0.0.1:8077
 
@@ -54,9 +59,11 @@ web/           giao diện chat
 - **Tag** FE / BE / event cho symbol
 - **Auto re-index**: theo dõi file project, đổi là cập nhật (watchdog)
 - **Xoá index** + tự dọn khi đổi project (tránh phình DB)
+- **Tóm tắt AI** (nút **Tóm tắt**): LLM tóm tắt "tác dụng" từng file + dựng **bản đồ tổng quan** dự án (nút **Tổng quan**), nạp vào ngữ cảnh để trả lời sâu hơn
+- **1-click + icon**: shortcut Desktop (`install_shortcut.ps1`)
 
 ## Roadmap
 
 - **Phase 1 ✅:** index file/symbol + chat RAG.
 - **Phase 2 ✅:** call graph, trích route API, tag FE/BE/event, auto re-index.
-- **Phase 3:** LLM tóm tắt "tác dụng", project map, context pack thông minh, đóng gói 1-click + icon.
+- **Phase 3 ✅:** LLM tóm tắt "tác dụng", project overview, context pack thông minh, đóng gói 1-click + icon.

@@ -10,6 +10,7 @@ from ..config import WEB_DIR, HOST, PORT
 from ..storage import db, vectors
 from ..indexer.runner import index_project
 from ..indexer.watcher import manager as watcher
+from ..indexer import summarizer
 from ..retrieval.search import build_context, get_related
 from ..chat.agent import ChatSession
 
@@ -28,7 +29,26 @@ class ChatBody(BaseModel):
 @app.get("/api/status")
 def status():
     db.init_db()
-    return db.get_status()
+    s = db.get_status()
+    s["summary"] = db.summary_counts()
+    return s
+
+
+@app.post("/api/summarize")
+def summarize():
+    """Tom tat 'tac dung' tung file + dung overview (chay nen)."""
+    summarizer.start_background(make_overview=True)
+    return {"ok": True}
+
+
+@app.get("/api/summarize/status")
+def summarize_status():
+    return summarizer.progress
+
+
+@app.get("/api/overview")
+def overview():
+    return {"overview": db.get_meta("overview") or ""}
 
 
 @app.post("/api/index")

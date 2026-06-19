@@ -51,8 +51,16 @@ def build_context(query: str):
     if not cands:
         return "", []
 
+    lines = []
+    # Project overview (neu da tom tat - Phase 3)
+    overview = db.get_meta("overview")
+    if overview:
+        lines.append("=== TỔNG QUAN DỰ ÁN ===")
+        lines.append(overview[:1200])
+        lines.append("")
+
     # Danh sach symbol lien quan (lay signature tu DB neu thieu)
-    lines = ["=== SYMBOL LIEN QUAN ==="]
+    lines.append("=== SYMBOL LIEN QUAN ===")
     files_order = []
     for c in cands[:15]:
         sig = c["signature"]
@@ -93,9 +101,11 @@ def build_context(query: str):
         sk = db.get_skeleton(fp)
         if not sk:
             continue
-        if len(text) + len("\n".join(sk_parts)) + len(sk) > CONTEXT_CHAR_BUDGET:
+        summ = db.get_file_summary(fp)
+        block = (f"[TÓM TẮT] {summ}\n{sk}" if summ else sk)
+        if len(text) + len("\n".join(sk_parts)) + len(block) > CONTEXT_CHAR_BUDGET:
             break
-        sk_parts.append(sk)
+        sk_parts.append(block)
         used.append(fp)
 
     if len(sk_parts) > 1:

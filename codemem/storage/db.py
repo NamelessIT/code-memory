@@ -62,11 +62,15 @@ def init_db():
             value TEXT
         );
     """)
-    # Migration: them cot tag cho DB cu
-    try:
-        conn.execute("ALTER TABLE symbols ADD COLUMN tag TEXT DEFAULT ''")
-    except sqlite3.OperationalError:
-        pass
+    # Migration: them cot cho DB cu
+    for stmt in (
+        "ALTER TABLE symbols ADD COLUMN tag TEXT DEFAULT ''",
+        "ALTER TABLE files ADD COLUMN summary TEXT DEFAULT ''",
+    ):
+        try:
+            conn.execute(stmt)
+        except sqlite3.OperationalError:
+            pass
     conn.commit()
     conn.close()
 
@@ -254,3 +258,53 @@ def set_meta(key, value):
     )
     conn.commit()
     conn.close()
+
+
+def get_meta(key):
+    conn = _conn()
+    row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    conn.close()
+    return row["value"] if row else None
+
+
+# ---- Tom tat (Phase 3) ----
+def set_file_summary(path, summary):
+    conn = _conn()
+    conn.execute("UPDATE files SET summary=? WHERE path=?", (summary, path))
+    conn.commit()
+    conn.close()
+
+
+def files_needing_summary():
+    """File da co skeleton nhung chua co summary."""
+    conn = _conn()
+    rows = conn.execute(
+        "SELECT path, lang, skeleton FROM files WHERE COALESCE(summary,'')='' ORDER BY path"
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_file_summary(path):
+    conn = _conn()
+    row = conn.execute("SELECT summary FROM files WHERE path=?", (path,)).fetchone()
+    conn.close()
+    return (row["summary"] if row else "") or ""
+
+
+def all_file_summaries(limit=200):
+    conn = _conn()
+    rows = conn.execute(
+        "SELECT path, summary FROM files WHERE COALESCE(summary,'')<>'' ORDER BY path LIMIT ?",
+        (limit,),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def summary_counts():
+    conn = _conn()
+    total = conn.execute("SELECT COUNT(*) c FROM files").fetchone()["c"]
+    done = conn.execute("SELECT COUNT(*) c FROM files WHERE COALESCE(summary,'')<>''").fetchone()["c"]
+    conn.close()
+    return {"total": total, "summarized": done}

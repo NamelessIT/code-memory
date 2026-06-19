@@ -83,6 +83,23 @@ def index_file(path, lang, skeleton, symbols):
         col.add(documents=docs, metadatas=metas, ids=ids)
 
 
+def index_summary(path, lang, summary):
+    """Them/cap nhat doc tom tat cua file vao vector index."""
+    col = get_collection()
+    if col is None or not summary:
+        return
+    sid = f"{path}::summary"
+    try:
+        col.delete(ids=[sid])
+    except Exception:
+        pass
+    col.add(
+        documents=[summary],
+        metadatas=[{"file_path": path, "lang": lang, "kind": "summary", "name": path}],
+        ids=[sid],
+    )
+
+
 def query(text, n=12):
     """Semantic search -> list metadata (kem file_path, name, kind...)."""
     col = get_collection()

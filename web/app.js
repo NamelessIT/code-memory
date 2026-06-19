@@ -121,6 +121,31 @@ async function send(forced) {
   }
 }
 
+async function summarize() {
+  const btn = $("summarizeBtn");
+  btn.disabled = true;
+  await fetch("/api/summarize", { method: "POST" });
+  addMsg("assistant").textContent = "🧩 Đang tóm tắt từng file + dựng tổng quan (chạy nền). Có thể mất vài phút tuỳ số file…";
+  const poll = setInterval(async () => {
+    const p = await (await fetch("/api/summarize/status")).json();
+    if (p.total) $("status").textContent = `Tóm tắt: ${p.done}/${p.total} (${p.phase})`;
+    if (!p.running) {
+      clearInterval(poll);
+      btn.disabled = false;
+      addMsg("assistant").textContent = "✅ Đã tóm tắt xong. Bấm 'Tổng quan' để xem bản đồ dự án; câu trả lời giờ sẽ chi tiết hơn.";
+      loadStatus();
+    }
+  }, 2000);
+}
+
+async function showOverview() {
+  const res = await (await fetch("/api/overview")).json();
+  const b = addMsg("assistant");
+  b.innerHTML = res.overview
+    ? renderMarkdown(res.overview)
+    : "Chưa có tổng quan. Bấm <b>Tóm tắt</b> trước nhé.";
+}
+
 async function clearIndex() {
   if (!confirm("Xoá toàn bộ index codebase (SQLite + vector)? Lịch sử chat giữ nguyên.")) return;
   await fetch("/api/clear", { method: "POST" });
@@ -137,6 +162,8 @@ async function resetChat() {
 $("sendBtn").onclick = () => send();
 $("indexBtn").onclick = indexProject;
 $("routesBtn").onclick = showRoutes;
+$("summarizeBtn").onclick = summarize;
+$("overviewBtn").onclick = showOverview;
 $("clearBtn").onclick = clearIndex;
 $("resetBtn").onclick = resetChat;
 $("input").addEventListener("keydown", (e) => {
