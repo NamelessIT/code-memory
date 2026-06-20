@@ -52,11 +52,13 @@ def ensure_embed_current():
     return False
 
 
-def _retry_tombstones(batch=50):
-    """Retry cleanup intent den han (fair batching + backoff). Tra so da clear (#P0-10)."""
+def _retry_tombstones(batch=50, scopes=None):
+    """Retry cleanup intent den han (fair batching + backoff). scopes=None -> moi scope (#P0-10)."""
     cleared = 0
     for t in db.due_tombstones(batch):
         scope = t["scope"]
+        if scopes is not None and scope not in scopes:
+            continue
         if scope == "collection":
             ok = vectors.clear_all()
         elif scope == "project":
@@ -67,15 +69,24 @@ def _retry_tombstones(batch=50):
             db.del_tombstone(t["id"])
             cleared += 1
         else:
-            db.record_tombstone_failure(t["id"], "vector delete failed")
+            db.record_tombstone_failure(t["id"], vectors.last_error() or "vector delete failed")
     return cleared
 
 
 @_locked
-def reconcile_vectors(pid, progress=None):
-    """Repair vector pending/thieu + retry tombstone delete (#P0-5/#P0-10)."""
+def cleanup_worker(batch=50):
+    """Retry MOI cleanup intent, KHONG phu thuoc active project (#P0-10).
+    Dung cho startup + /api/cleanup/retry khi khong co project active (sau clear/xoa het)."""
+    return _retry_tombstones(batch=batch)
+
+
+@_locked
+def reconcile_vectors(pid, progress=None, include_collection=True):
+    """Repair vector pending/thieu + retry tombstone (#P0-5/#P0-10).
+    include_collection=False khi goi ngay sau index (fence: khong wipe collection vua ghi)."""
     ensure_embed_current()
-    tomb = _retry_tombstones()
+    scopes = None if include_collection else {"file", "project"}
+    tomb = _retry_tombstones(scopes=scopes)
     repaired = still_pending = 0
     for f in db.files_pending_vector(pid):
         syms = db.get_symbols_for_file(f["path"], project_id=pid)
@@ -98,6 +109,10 @@ def index_project(root: str, progress=None):
     root = canonical_root(root)
     pid = db.get_or_create_project(root)
     db.set_active_project(pid)
+
+    # Fence (#P0-10): xu ly collection-clear intent dang cho TRUOC khi ghi vector moi,
+    # de khong index xong roi bi collection-wipe xoa mat.
+    _retry_tombstones(scopes={"collection"})
 
     existing = db.get_indexed_hashes(pid)
     seen = set()
@@ -125,12 +140,12 @@ def index_project(root: str, progress=None):
     # File da bi xoa khoi disk -> go khoi index (trong project nay)
     removed = [p for p in existing if p not in seen]
     for p in removed:
-        db.delete_file(p, project_id=pid)
-        if not vectors.delete_file(p, project_id=pid):
-            db.add_tombstone("file", pid, p)     # vector delete fail -> retry sau (#P0-10)
+        db.delete_file(p, project_id=pid)        # ghi intent atomic (outbox)
+        if vectors.delete_file(p, project_id=pid):
+            db.ack_tombstone("file", pid, p)     # vector da xoa -> ack; fail -> intent giu lai retry
 
-    # Repair vector pending (ke ca file unchanged nhung vector tung loi)
-    rec = reconcile_vectors(pid, progress)
+    # Repair vector pending; KHONG xu ly collection o day (vua ghi vector) (#P0-10 fence)
+    rec = reconcile_vectors(pid, progress, include_collection=False)
     db.touch_project(pid)
 
     return {
@@ -165,6 +180,6 @@ def remove_file(path: str, project_id=None):
     """Go 1 file khoi index (file bi xoa). Bind project_id co dinh."""
     pid = project_id if project_id is not None else db.active_project_id()
     sp = os.path.normcase(str(Path(path)))
-    db.delete_file(sp, project_id=pid)
-    if not vectors.delete_file(sp, project_id=pid):
-        db.add_tombstone("file", pid, sp)        # vector delete fail -> retry sau (#P0-10)
+    db.delete_file(sp, project_id=pid)           # ghi intent atomic (outbox)
+    if vectors.delete_file(sp, project_id=pid):
+        db.ack_tombstone("file", pid, sp)        # fail -> intent giu lai, worker retry

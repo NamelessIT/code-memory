@@ -5,7 +5,7 @@ import codemem.indexer.runner as runner
 def _isolate(monkeypatch):
     """Tach reconcile khoi DB that: bo qua embed-check + tombstone."""
     monkeypatch.setattr(runner, "ensure_embed_current", lambda: False)
-    monkeypatch.setattr(runner, "_retry_tombstones", lambda: 0)
+    monkeypatch.setattr(runner, "_retry_tombstones", lambda *a, **k: 0)
 
 
 def test_reconcile_repairs_pending(monkeypatch):
@@ -58,6 +58,29 @@ def test_retry_tombstones_backoff_on_failure(monkeypatch):
                         lambda tid: (_ for _ in ()).throw(AssertionError("khong duoc del khi fail")))
     assert runner._retry_tombstones() == 0
     assert failed == [1]
+
+
+def test_cleanup_worker_independent_of_project(monkeypatch):
+    # #P0-10: cleanup_worker retry moi scope, KHONG can active project
+    monkeypatch.setattr(runner.db, "due_tombstones",
+                        lambda batch=50: [{"id": 1, "scope": "project", "project_id": 9, "file_path": ""}])
+    monkeypatch.setattr(runner.vectors, "delete_project", lambda pid: True)
+    deleted = []
+    monkeypatch.setattr(runner.db, "del_tombstone", lambda tid: deleted.append(tid))
+    assert runner.cleanup_worker() == 1 and deleted == [1]
+
+
+def test_retry_scopes_filter_excludes_collection(monkeypatch):
+    # #P0-10 fence: scopes={'file'} -> KHONG dung clear_all (collection bo qua)
+    tombs = [{"id": 1, "scope": "file", "project_id": 2, "file_path": "/a"},
+             {"id": 2, "scope": "collection", "project_id": 0, "file_path": ""}]
+    monkeypatch.setattr(runner.db, "due_tombstones", lambda batch=50: tombs)
+    monkeypatch.setattr(runner.vectors, "delete_file", lambda p, project_id=None: True)
+    cleared_collection = []
+    monkeypatch.setattr(runner.vectors, "clear_all", lambda: cleared_collection.append(1) or True)
+    monkeypatch.setattr(runner.db, "del_tombstone", lambda tid: None)
+    runner._retry_tombstones(scopes={"file"})
+    assert cleared_collection == []                # collection KHONG bi xu ly khi fence
 
 
 def test_ensure_embed_current_marks_stale(tmp_path, monkeypatch):

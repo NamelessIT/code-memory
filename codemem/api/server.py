@@ -107,10 +107,10 @@ def project_delete(body: ProjectBody):
         if db.active_project_id() == body.id:
             watcher.stop()
             session.history.clear()
-        db.delete_project(body.id)          # tu chon active ke tiep neu xoa active
+        db.delete_project(body.id)          # ghi project intent atomic + tu chon active ke tiep
         vec_ok = vectors.delete_project(body.id)
-        if not vec_ok:
-            db.add_tombstone("project", body.id)         # retry xoa vector sau (#P0-10)
+        if vec_ok:
+            db.ack_tombstone("project", body.id)         # fail -> intent giu lai, worker retry (#P0-10)
         p = db.get_active_project()
         if p and os.path.isdir(p["root"]):
             try:
@@ -129,6 +129,14 @@ def reconcile():
     if pid is None:
         return JSONResponse({"error": "Chua co project active"}, status_code=400)
     return reconcile_vectors(pid)
+
+
+@app.post("/api/cleanup/retry")
+def cleanup_retry():
+    """Retry cleanup intent (tombstone) - KHONG phu thuoc active project (#P0-10)."""
+    from ..indexer.runner import cleanup_worker
+    cleared = cleanup_worker()
+    return {"cleared": cleared, "cleanup": db.tombstone_stats()}
 
 
 @app.post("/api/summarize")
@@ -222,9 +230,10 @@ def clear_index():
         watcher.stop()
         db.init_db()
         db.clear_all()                     # da wipe ca vector_tombstones cu
+        db.add_tombstone("collection")     # outbox: ghi intent TRUOC khi xoa vector (#P0-10)
         vec_ok = vectors.clear_all()
-        if not vec_ok:                     # clear vector fail -> intent retry collection (#P0-10)
-            db.add_tombstone("collection")
+        if vec_ok:
+            db.ack_tombstone("collection")  # thanh cong -> ack; fail -> intent giu lai retry
         session.history.clear()            # evidence da mat -> khong giu chat cu
     return {"ok": True, "sqlite_cleared": True, "vector_cleared": vec_ok,
             "pending_cleanup": db.tombstone_stats()["pending"]}
@@ -238,16 +247,17 @@ def main():
     import uvicorn
     db.init_db()
     # Neu da tung index project va path con ton tai -> bat watcher (tranh crash startup)
+    import threading
+    from ..indexer.runner import reconcile_vectors, cleanup_worker
     p = db.get_active_project()
     if p and os.path.isdir(p["root"]):
         try:
             watcher.start(p["root"], project_id=p["id"])
         except Exception as e:
             print(f"[warn] khong bat duoc watcher: {e}")
-        # Repair vector pending/stale o nen (khong chan startup) - #P0-5
-        import threading
-        from ..indexer.runner import reconcile_vectors
         threading.Thread(target=lambda: reconcile_vectors(p["id"]), daemon=True).start()
+    # Cleanup worker doc lap project (xu ly intent ke ca khi khong co active project) - #P0-10
+    threading.Thread(target=cleanup_worker, daemon=True).start()
     print(f"code-memory chay tai http://{HOST}:{PORT}")
     uvicorn.run(app, host=HOST, port=PORT)
 

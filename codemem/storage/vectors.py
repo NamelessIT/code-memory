@@ -87,22 +87,29 @@ def available():
     return _client() is not None
 
 
+def last_error():
+    return _last_error
+
+
 def _delete_where(where):
     """Tra ve True (da xoa hoac khong co gi de xoa) / False (unavailable hoac loi that)."""
     cl = _client()
     if cl is None:
         return False                       # unavailable -> KHONG dam bao da xoa
+    global _last_error
     try:
         col = cl.get_collection(CHROMA_COLLECTION)
     except Exception as e:
         if _is_absent(e):
             return True                    # collection thuc su khong co -> khong gi de xoa = OK
+        _last_error = f"get_collection: {e}"
         print(f"[warn] vector get_collection loi (KHONG phai absent): {e}")
         return False                       # loi IO/corrupt -> bao that bai that
     try:
         col.delete(where=where)
         return True
     except Exception as e:
+        _last_error = f"delete: {e}"
         print(f"[warn] vector delete loi: {e}")
         return False
 
@@ -131,6 +138,7 @@ def clear_all():
         if _is_absent(e):
             ok = True                      # khong co collection = da sach
         else:
+            globals()["_last_error"] = f"clear_all: {e}"
             print(f"[warn] vector clear_all delete_collection loi: {e}")
             ok = False                     # loi that -> KHONG bao True oan
     _collection = None

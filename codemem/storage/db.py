@@ -69,11 +69,12 @@ def init_db():
             UNIQUE(scope, project_id, file_path)
         );
     """)
-    # Recreate vector_tombstones cu (round truoc, thieu cot attempts/dedup)
+    # Upgrade vector_tombstones v1 -> v2 GIU LAI row pending (#P0-10): rename/create/insert-select/drop
     tcols = [r["name"] for r in conn.execute("PRAGMA table_info(vector_tombstones)")]
     if "attempts" not in tcols:
+        now = datetime.now().isoformat()
         conn.executescript("""
-            DROP TABLE IF EXISTS vector_tombstones;
+            ALTER TABLE vector_tombstones RENAME TO vector_tombstones_v1;
             CREATE TABLE vector_tombstones (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 scope TEXT NOT NULL,
@@ -86,6 +87,11 @@ def init_db():
                 UNIQUE(scope, project_id, file_path)
             );
         """)
+        conn.execute(
+            "INSERT OR IGNORE INTO vector_tombstones(scope, project_id, file_path, next_retry, created_at) "
+            "SELECT COALESCE(scope,'file'), COALESCE(project_id,0), COALESCE(file_path,''), ?, COALESCE(created_at,?) "
+            "FROM vector_tombstones_v1", (now, now))
+        conn.execute("DROP TABLE vector_tombstones_v1")
     # Migration cot cho DB cu (truoc multi-project)
     for stmt in (
         "ALTER TABLE symbols ADD COLUMN tag TEXT DEFAULT ''",
@@ -335,8 +341,11 @@ def delete_project(pid):
         conn.execute(f"DELETE FROM {t} WHERE project_id=?", (pid,))
     conn.execute("DELETE FROM projects WHERE id=?", (pid,))
     conn.execute("DELETE FROM meta WHERE key=?", (f"overview:{pid}",))
-    # Collapse cleanup intent file cu cua project nay (#P0-10); intent project-scope se them sau neu can
+    # Collapse intent file cu + ghi intent project-scope trong CUNG transaction (outbox #P0-10)
     conn.execute("DELETE FROM vector_tombstones WHERE project_id=? AND scope='file'", (pid,))
+    now = datetime.now().isoformat()
+    conn.execute("INSERT OR IGNORE INTO vector_tombstones(scope, project_id, file_path, next_retry, created_at) "
+                 "VALUES ('project',?,'',?,?)", (pid, now, now))
     if was_active:
         nxt = conn.execute("SELECT id FROM projects ORDER BY id LIMIT 1").fetchone()
         if nxt:
@@ -391,6 +400,8 @@ def upsert_file(path, lang, file_hash, skeleton, symbols, edges=None, routes=Non
 
 
 def delete_file(path, project_id=None):
+    """Xoa file khoi SQLite + ghi cleanup intent vector trong CUNG transaction (outbox #P0-10).
+    Caller goi vectors.delete_file roi ack_tombstone khi thanh cong."""
     conn = _conn()
     pid = project_id if project_id is not None else _active_pid(conn)
     for t in ("symbols", "edges", "routes"):
@@ -398,6 +409,18 @@ def delete_file(path, project_id=None):
     conn.execute("DELETE FROM files WHERE project_id=? AND path=?", (pid, path))
     if pid is not None:
         conn.execute("DELETE FROM meta WHERE key=?", (f"overview:{pid}",))  # invalidate overview
+    now = datetime.now().isoformat()
+    conn.execute("INSERT OR IGNORE INTO vector_tombstones(scope, project_id, file_path, next_retry, created_at) "
+                 "VALUES ('file',?,?,?,?)", (pid or 0, path, now, now))
+    conn.commit()
+    conn.close()
+
+
+def ack_tombstone(scope, project_id=0, file_path=""):
+    """Xoa intent khi vector delete da thanh cong (#P0-10 outbox ack)."""
+    conn = _conn()
+    conn.execute("DELETE FROM vector_tombstones WHERE scope=? AND project_id=? AND file_path=?",
+                 (scope, project_id or 0, file_path or ""))
     conn.commit()
     conn.close()
 
