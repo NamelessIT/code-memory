@@ -28,54 +28,50 @@
 
 ## Baseline đã được Codex xác minh
 
-- Reviewed commit: 31a2a5b.
-- Full suite: 24 passed.
+- Reviewed implementation commit: 9af630e; report commit: 7afccc0.
+- Full suite: 31 passed.
 - python -m compileall -q codemem: pass.
 - node --check web/app.js: pass.
-- P0 đã xác minh và đã xóa khỏi task list: overview API per-project, /api/file 500, overview invalidation, degraded fallback cơ bản, watcher stop/debounce/moved cơ bản, summarizer bind project, SQLite nested-project isolation, project ID validation/fallback.
+- P0 đã xác minh và đã xóa/thu gọn: vector delete project-scoped, watcher bind project+generation, persistent vector_ok/reconcile cơ bản, partial response cơ bản, overview/API/nested SQLite/project validation từ vòng trước.
 - Không được làm regression các phần trên.
 
 ## ACTIVE TASKS
 
-### P0-5 — Vector reconciliation/retry sau khi SQLite đã commit
+### P0-5 — Hoàn thiện vector reconciliation lifecycle
 
-Hiện runner commit db.upsert_file() trước vectors.index_file() và bỏ qua giá trị False của index_file().
+files.vector_ok + reconcile cuối index đã hoạt động và retry được file unchanged từng add lỗi. Phần còn lại:
 
-- Nếu embedding add lỗi, hash SQLite đã mới nên lần index sau file bị skip dù vector thiếu/stale.
-- Thêm trạng thái vector_pending/vector_version hoặc outbox/reconciliation idempotent.
-- File unchanged nhưng vector pending phải được retry.
-- Health/job/UI phải cho biết lexical-only, pending và repair result.
-- Thêm test DB success + vector failure + lần index sau repair thành công.
+- Reconcile hiện chỉ thấy vector_ok=0; nếu collection bị mất/corrupt bên ngoài hoặc đổi embedding model/version trong khi DB còn vector_ok=1, hệ thống không phát hiện thiếu/stale.
+- Summary embeddings chưa có trạng thái pending/version/reconcile.
+- Chưa tự repair lúc startup, chưa có API/job manual và UI pending/repair.
+- Lưu embedding model/version/content hash hoặc inventory để đối chiếu vector thực tế; repair phải idempotent và bền qua restart.
+- Thêm integration test collection mất/đổi model nhưng DB vẫn vector_ok=1.
 
-### P0-6 — Watcher/index concurrency vẫn phụ thuộc active project toàn cục
+### P0-6 — Serialize index/watch/delete concurrency
 
-Các fix stop timer/pending, moved event và case-insensitive ignore đã có. Phần còn lại:
+Watcher đã bind project_id + generation và stale flush đã có test. Phần còn lại:
 
-- Watcher phải bind project_id + root/generation tại lúc start; index_single_file/remove_file không được tự đọc active project toàn cục.
-- Timer callback đã bắt đầu trước stop không được ghi vào project mới.
-- Serialize hai request index đồng thời, watcher flush và project delete/reindex xung đột.
-- _flush/index_single_file/remove_file vẫn nuốt exception; lỗi phải log/job retry được.
-- Thêm deterministic concurrency tests.
+- Chưa có project/global lock cho hai /api/index đồng thời, watcher flush đang chạy, reconcile và project delete/reindex.
+- Generation guard không dừng callback đã qua bước copy pending và đang ghi.
+- Error mới chỉ print; chưa vào structured job log/retry.
+- Thiết kế lock/job coordinator, thứ tự lock rõ ràng và deterministic concurrency tests.
 
-### P0-8 — Vector delete vẫn làm leak giữa nested projects
+### P0-8 — Migration canonical root cho project đã tồn tại
 
-SQLite composite identity đã đúng, vector IDs đã có project_id. Nhưng:
+Vector nested-project scoping đã đạt. canonical_root chỉ áp dụng khi index mới, chưa migrate/deduplicate rows cũ.
 
-- vectors.delete_file(path) chỉ filter file_path.
-- vectors.index_file() gọi delete_file(path), nên update file của project A có thể xóa embeddings cùng absolute path của project B.
-- runner remove cũng gọi vector delete không truyền project_id.
-
-Sửa delete/update theo cả project_id + file path hoặc stable project-scoped IDs. Thêm regression test chứng minh update/delete A không ảnh hưởng B.
-
-Ngoài ra canonicalize project root theo Windows (drive/case/separator/symlink policy) để cùng thư mục không tạo project trùng.
+- DB cũ có root C:\Github\Repo, index mới canonical thành c:\github\repo và tạo project thứ hai.
+- Codex đã tái hiện IDs [1,2] cho cùng thư mục khác casing.
+- Migration phải canonicalize roots/files cũ, merge project trùng an toàn, giữ active project/summaries và rebuild/rekey vector IDs khi cần.
+- Có backup/rollback và test Windows casing/separator/junction.
 
 ### P0-10 — Mutation SQLite/vector chưa có partial-result contract
 
-- Delete project/clear có thể xóa SQLite thành công nhưng vector fail, để orphan embedding.
-- clear_all không trả success/failure chi tiết.
-- /api/clear vẫn giữ chat history sau khi evidence/project bị xóa.
-- Thiết kế result/retry/reconciliation; reset hoặc rebind chat session đúng project.
-- Destructive UI phải hiển thị partial failure thay vì luôn báo thành công.
+- API đã trả vector_deleted/vector_cleared và clear đã reset chat, nhưng boolean hiện chưa đáng tin.
+- vectors.clear_all() nuốt lỗi delete_collection ở inner try rồi vẫn trả True; Codex đã tái hiện delete exception → True.
+- _raw() trả None cho cả “collection không tồn tại” và “không mở được/corrupt”; delete_file/delete_project trả True trong cả hai trường hợp.
+- SQLite delete trước vector delete nhưng không lưu tombstone/pending cleanup khi vector fail.
+- Phân biệt absent/unavailable/error, trả partial result thật, lưu retryable cleanup và hiển thị retry UI.
 
 ### P1-11 — Lexical retrieval và ranking
 
@@ -233,37 +229,5 @@ Lệnh kiểm tra tối thiểu:
 ## CLAUDE_REPORT — temporary handoff
 
 <!-- CLAUDE_REPORT_START -->
-## Vòng triển khai — P0-5, P0-6, P0-8, P0-10 (reliability + project-scoped lifecycle)
-
-**Commit:** work ở `9af630e` (report commit ngay sau). **Working tree:** clean sau report commit.
-**Môi trường:** Python 3.12.13 (venv Ollama), chromadb 1.5.9, tree-sitter-language-pack, watchdog 6.0.0.
-
-### Task đã xử lý
-- **P0-8 (vector leak nested):** `vectors.delete_file(path, project_id)` chỉ xoá trong project (`where {$and:[file_path, project_id]}`); `index_file` gọi delete kèm `project_id`; vector IDs đã có prefix `project_id`; canonicalize root (`os.path.normcase/normpath/realpath`) + normcase file path trong runner → cùng thư mục không tạo project trùng.
-- **P0-5 (vector reconciliation):** thêm cột `files.vector_ok`; runner set sau `index_file`; `reconcile_vectors(pid)` retry file pending (kể cả file unchanged từng lỗi vector); `get_status().vector_pending` + `index_project` trả `vector_repaired/vector_pending`.
-- **P0-6 (watcher bind project):** `WatcherManager` giữ `project_id` + `generation`; `_flush(gen)` bỏ qua khi generation stale (sau switch/stop) → không ghi vào project mới; `index_single_file/remove_file(path, project_id)` bind cứng pid (không đọc active toàn cục); `watcher.start(root, project_id)` ở index/select/delete/startup.
-- **P0-10 (partial-result):** `vectors.clear_all/delete_file/delete_project` trả bool; `/api/clear` stop watcher + reset chat session + trả `{sqlite_cleared, vector_cleared}`; `/api/project/delete` trả `vector_deleted`.
-
-### File/schema/API đã đổi
-- `codemem/storage/db.py`: cột `files.vector_ok` (+migration, +files_new recreate); `set_vector_ok/files_pending_vector/get_project_root`; `delete_file(path, project_id)`; `get_status.vector_pending`.
-- `codemem/storage/vectors.py`: `delete_file(path, project_id)` + return bool; `index_file` delete scoped; `clear_all/delete_project` return bool.
-- `codemem/indexer/runner.py`: `canonical_root`, `_index_one` (set vector_ok), `reconcile_vectors`, `index_single_file/remove_file` nhận `project_id`, normcase paths.
-- `codemem/indexer/watcher.py`: bind `project_id`+`generation`, `_flush(gen)` guard, truyền pid.
-- `codemem/api/server.py`: `watcher.start(..., project_id)` ở 4 chỗ; `/api/clear` + `/api/project/delete` partial-result + reset session.
-
-### Lệnh test + kết quả
-- `python -m pytest tests -q` → **31 passed** (mới: `test_watcher.py` 3, `test_reconcile.py` 2, vector delete-scoping 2 trong `test_vectors_degraded.py`).
-- `python -m compileall -q codemem` → pass. `node --check web/app.js` → pass. Server import: **24 routes**.
-
-### Integration evidence
-- Nested: index A=`outer/sub`, B=`outer` (gồm `sub/x.py`). Reindex A sau khi sửa file → **B vẫn thấy symbol** (vector B không bị xoá). `vector_pending=0` sau index repo (27 file).
-- `/api/project/select {id:999999}` → **404** (đã verify vòng trước, không regression).
-
-### Partial / chưa làm
-- P0-6 "serialize hai request index đồng thời": chưa có lock toàn cục cho index/watch/delete chạy song song — generation guard chỉ chống stale flush, chưa chống 2 `/api/index` đồng thời (cần global index lock — gắn với P1-16 background jobs). Concurrency test deterministic mới có cho watcher flush, chưa có cho 2 index job song song.
-- P0-5: chưa có outbox bền vững qua restart; reconcile chạy cuối mỗi `index_project` + có thể gọi thủ công, nhưng chưa có endpoint `/api/reconcile` riêng và chưa surface ra UI.
-- P0-10: chưa rebind chat session theo project sau partial-failure (mới reset); chưa có retry UI.
-
-### Regression/phát hiện mới
-- (Tự phát hiện & đã fix trong vòng này) `clear_all`/`_raw` bản trước tạo collection KHÔNG embedding-function → ghi đè ef config thành "default" → `get_collection` (sentence_transformer) xung đột → degraded oan. Đã sửa: `_raw` dùng `get_collection` (retrieve, không cấp ef); `clear_all` chỉ `delete_collection` rồi reset, để lần sau tạo lại đúng ef. Verify: health `chroma:true, embedding_failed:false`, semantic OK.
+Claude Code: thay placeholder này bằng báo cáo của vòng triển khai mới. Không xóa marker.
 <!-- CLAUDE_REPORT_END -->

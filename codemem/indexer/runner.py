@@ -1,11 +1,26 @@
 """Dieu phoi index: walker -> parser -> SQLite + ChromaDB. Index tang dan theo hash.
 Vector la derived index: SQLite la source of truth, vector co the repair (reconcile)."""
 import os
+import threading
 from pathlib import Path
 
 from .walker import walk_source_files, file_hash, read_text, detect_lang
 from .parser import parse_file, build_skeleton
 from ..storage import db, vectors
+
+# Serialize moi thao tac ghi nang (#P0-6): index/reconcile/single-file/delete/clear.
+# RLock -> cho phep reconcile_vectors duoc goi long trong index_project cung thread.
+INDEX_LOCK = threading.RLock()
+
+
+def _locked(fn):
+    import functools
+
+    @functools.wraps(fn)
+    def wrap(*a, **k):
+        with INDEX_LOCK:
+            return fn(*a, **k)
+    return wrap
 
 
 def canonical_root(root: str) -> str:
@@ -27,6 +42,7 @@ def _index_one(spath, lang, h, root, pid, progress=None):
     return vec_ok
 
 
+@_locked
 def reconcile_vectors(pid, progress=None):
     """Repair vector cho file co trong SQLite nhung vector pending/thieu (#P0-5)."""
     repaired = still_pending = 0
@@ -43,9 +59,16 @@ def reconcile_vectors(pid, progress=None):
     return {"repaired": repaired, "pending": still_pending}
 
 
+@_locked
 def index_project(root: str, progress=None):
     """Index project tai 'root' (incremental). KHONG wipe project khac."""
     db.init_db()
+    # Doi embedding model -> moi vector stale, danh dau de reconcile (#P0-5)
+    from ..config import EMBED_MODEL
+    if db.get_meta("embed_model") != EMBED_MODEL:
+        db.mark_all_vectors_stale()
+        db.set_meta("embed_model", EMBED_MODEL)
+
     root = canonical_root(root)
     pid = db.get_or_create_project(root)
     db.set_active_project(pid)
@@ -91,6 +114,7 @@ def index_project(root: str, progress=None):
     }
 
 
+@_locked
 def index_single_file(path: str, project_id=None):
     """Index lai 1 file (watcher). Bind project_id CO DINH (khong doc active toan cuc - #P0-6)."""
     p = Path(path)
@@ -109,6 +133,7 @@ def index_single_file(path: str, project_id=None):
         return False
 
 
+@_locked
 def remove_file(path: str, project_id=None):
     """Go 1 file khoi index (file bi xoa). Bind project_id co dinh."""
     pid = project_id if project_id is not None else db.active_project_id()

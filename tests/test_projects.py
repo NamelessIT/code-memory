@@ -83,6 +83,22 @@ def test_delete_active_picks_next(tmp_path, monkeypatch):
     assert db.active_project_id() == b               # tu chon project con lai
 
 
+def test_canonical_root_merge_migration(tmp_path, monkeypatch):
+    # #P0-8: hai project cung canonical root khac casing -> migration merge con 1
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "merge.db")
+    db.init_db()
+    conn = db._conn()
+    conn.execute("INSERT INTO projects(root,name,created_at,last_indexed_at) VALUES (?,?,?,?)",
+                 ("C:\\Repo\\App", "App", "t", "t"))
+    conn.execute("INSERT INTO projects(root,name,created_at,last_indexed_at) VALUES (?,?,?,?)",
+                 ("c:\\repo\\app", "app", "t", "t"))
+    conn.execute("DELETE FROM meta WHERE key='roots_canon_v1'")   # cho migration chay lai
+    conn.commit()
+    conn.close()
+    db.init_db()                                   # trigger _migrate_canonical_roots
+    assert len(db.list_projects()) == 1
+
+
 def test_indexed_hashes_scoped(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "t2.db")
     db.init_db()

@@ -34,76 +34,93 @@ def get_collection():
         return None
 
 
-def _raw():
-    """Collection de delete/count (KHONG cung cap ef -> khong load model, khong ghi de ef config).
-    Dung get_collection (retrieve), neu chua ton tai -> None (khong co gi de xoa)."""
+# Trang thai delete: phan biet absent (khong co gi de xoa = thanh cong) vs unavailable/error.
+_ABSENT, _UNAVAILABLE = "absent", "unavailable"
+
+
+def _client():
+    """PersistentClient hoac None neu chroma khong mo duoc (corrupt/import loi)."""
     try:
         import chromadb
         ensure_dirs()
-        client = chromadb.PersistentClient(path=str(CHROMA_DIR))
-        return client.get_collection(CHROMA_COLLECTION)
+        return chromadb.PersistentClient(path=str(CHROMA_DIR))
+    except Exception as e:
+        global _last_error
+        _last_error = f"chroma client unavailable: {e}"
+        return None
+
+
+def _raw():
+    """Collection de delete/count (khong cung cap ef). None neu absent HOAC unavailable."""
+    cl = _client()
+    if cl is None:
+        return None
+    try:
+        return cl.get_collection(CHROMA_COLLECTION)
     except Exception:
         return None
 
 
 def health():
-    """Trang thai cho /api/health: chroma co dung khong (khong ep load embedding)."""
-    return {"chroma": _raw() is not None, "embedding_failed": _embed_failed, "error": _last_error}
+    """Trang thai cho /api/health (khong ep load embedding)."""
+    cl = _client()
+    chroma_ok = cl is not None
+    return {"chroma": chroma_ok, "embedding_failed": _embed_failed, "error": _last_error}
 
 
 def available():
-    return _raw() is not None
+    return _client() is not None
+
+
+def _delete_where(where):
+    """Tra ve True (da xoa hoac khong co gi de xoa) / False (unavailable hoac loi that)."""
+    cl = _client()
+    if cl is None:
+        return False                       # unavailable -> KHONG dam bao da xoa
+    try:
+        col = cl.get_collection(CHROMA_COLLECTION)
+    except Exception:
+        return True                        # collection absent -> khong co gi de xoa = OK
+    try:
+        col.delete(where=where)
+        return True
+    except Exception as e:
+        print(f"[warn] vector delete loi: {e}")
+        return False
 
 
 def delete_file(path, project_id=None):
-    """Xoa vector cua 1 file. Neu co project_id -> CHI xoa trong project do
-    (tranh xoa nham embeddings cung absolute path cua project khac - #P0-8)."""
-    col = _raw()
-    if col is None:
-        return True            # khong co vector store -> coi nhu khong con gi de xoa
-    try:
-        if project_id is not None:
-            col.delete(where={"$and": [{"file_path": path}, {"project_id": project_id}]})
-        else:
-            col.delete(where={"file_path": path})
-        return True
-    except Exception as e:
-        print(f"[warn] vector delete_file loi: {e}")
-        return False
+    """Xoa vector 1 file. Co project_id -> chi xoa trong project do (#P0-8)."""
+    if project_id is not None:
+        return _delete_where({"$and": [{"file_path": path}, {"project_id": project_id}]})
+    return _delete_where({"file_path": path})
 
 
 def delete_project(project_id):
-    col = _raw()
-    if col is None:
-        return True
-    try:
-        col.delete(where={"project_id": project_id})
-        return True
-    except Exception as e:
-        print(f"[warn] vector delete_project loi: {e}")
-        return False
+    return _delete_where({"project_id": project_id})
 
 
 def clear_all():
-    """Xoa collection (khong load embedding, KHONG tao lai voi ef 'default').
-    Lan get_collection() sau se tao lai voi embedding function dung."""
+    """Xoa collection (khong load embedding). True chi khi that su xoa duoc/absent."""
     global _collection, _raw_col, _embed_failed, _raw_failed
+    cl = _client()
+    if cl is None:
+        return False                       # khong mo duoc chroma -> bao that bai that
+    ok = True
     try:
-        import chromadb
-        ensure_dirs()
-        client = chromadb.PersistentClient(path=str(CHROMA_DIR))
-        try:
-            client.delete_collection(CHROMA_COLLECTION)
-        except Exception:
-            pass
-        _collection = None
-        _raw_col = None
-        _embed_failed = False     # reset de thu lai
-        _raw_failed = False
-        return True
+        cl.delete_collection(CHROMA_COLLECTION)
     except Exception as e:
-        print(f"[warn] vector clear_all loi: {e}")
-        return False
+        msg = str(e).lower()
+        if "exist" in msg or "not found" in msg or "does not" in msg:
+            ok = True                      # khong co collection = da sach
+        else:
+            print(f"[warn] vector clear_all delete_collection loi: {e}")
+            ok = False                     # loi that -> KHONG bao True oan
+    _collection = None
+    _raw_col = None
+    _embed_failed = False
+    _raw_failed = False
+    return ok
 
 
 def index_file(path, lang, skeleton, symbols, project_id=None):

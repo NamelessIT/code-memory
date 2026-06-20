@@ -9,7 +9,7 @@ from pydantic import BaseModel
 
 from ..config import WEB_DIR, HOST, PORT, MODEL, NUM_CTX, OLLAMA_URL
 from ..storage import db, vectors
-from ..indexer.runner import index_project
+from ..indexer.runner import index_project, INDEX_LOCK
 from ..indexer.watcher import manager as watcher
 from ..indexer import summarizer
 from ..retrieval.search import build_context, get_related
@@ -97,8 +97,9 @@ def project_delete(body: ProjectBody):
     if active == body.id:
         watcher.stop()
         session.history.clear()
-    db.delete_project(body.id)              # tu chon active ke tiep neu xoa active
-    vec_ok = vectors.delete_project(body.id)
+    with INDEX_LOCK:                        # serialize voi index/reconcile (#P0-6)
+        db.delete_project(body.id)          # tu chon active ke tiep neu xoa active
+        vec_ok = vectors.delete_project(body.id)
     # Neu con project active moi -> bat lai watcher
     p = db.get_active_project()
     if p and os.path.isdir(p["root"]):
@@ -108,6 +109,16 @@ def project_delete(body: ProjectBody):
             pass
     # Partial result: SQLite da xoa; bao ro vector co xoa duoc khong (#P0-10)
     return {"ok": True, "vector_deleted": vec_ok, "active": p}
+
+
+@app.post("/api/reconcile")
+def reconcile():
+    """Repair vector pending/stale cho project active (#P0-5)."""
+    from ..indexer.runner import reconcile_vectors
+    pid = db.active_project_id()
+    if pid is None:
+        return JSONResponse({"error": "Chua co project active"}, status_code=400)
+    return reconcile_vectors(pid)
 
 
 @app.post("/api/summarize")
@@ -196,9 +207,10 @@ def reset():
 def clear_index():
     """Xoa toan bo index (SQLite + ChromaDB). Dung watcher + reset chat (#P0-10)."""
     watcher.stop()
-    db.init_db()
-    db.clear_all()
-    vec_ok = vectors.clear_all()           # partial result: bao ro vector co xoa duoc khong
+    with INDEX_LOCK:                       # serialize voi index/reconcile (#P0-6)
+        db.init_db()
+        db.clear_all()
+        vec_ok = vectors.clear_all()       # partial result: bao ro vector co xoa duoc khong
     session.history.clear()                # evidence da mat -> khong giu chat cu
     return {"ok": True, "sqlite_cleared": True, "vector_cleared": vec_ok}
 
@@ -217,6 +229,10 @@ def main():
             watcher.start(p["root"], project_id=p["id"])
         except Exception as e:
             print(f"[warn] khong bat duoc watcher: {e}")
+        # Repair vector pending/stale o nen (khong chan startup) - #P0-5
+        import threading
+        from ..indexer.runner import reconcile_vectors
+        threading.Thread(target=lambda: reconcile_vectors(p["id"]), daemon=True).start()
     print(f"code-memory chay tai http://{HOST}:{PORT}")
     uvicorn.run(app, host=HOST, port=PORT)
 

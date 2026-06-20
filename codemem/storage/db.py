@@ -105,6 +105,13 @@ def init_db():
         conn.execute("INSERT INTO meta(key,value) VALUES('active_project_id',?) "
                      "ON CONFLICT(key) DO UPDATE SET value=?", (str(pid), str(pid)))
 
+    # Canonicalize + merge project trung canonical-root (Windows casing/separator) - #P0-8
+    rc = conn.execute("SELECT value FROM meta WHERE key='roots_canon_v1'").fetchone()
+    if not rc or rc["value"] != "1":
+        _migrate_canonical_roots(conn)
+        conn.execute("INSERT INTO meta(key,value) VALUES('roots_canon_v1','1') "
+                     "ON CONFLICT(key) DO UPDATE SET value='1'")
+
     # Doi schema version -> invalidate overview/summary cu (hallucination legacy)
     row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
     if (row["value"] if row else None) != SCHEMA_VERSION:
@@ -119,6 +126,75 @@ def init_db():
 def _name_from_root(root):
     import os
     return os.path.basename(os.path.normpath(root)) or root
+
+
+def _canon(root):
+    import os
+    try:
+        return os.path.normcase(os.path.normpath(os.path.realpath(str(root))))
+    except Exception:
+        return os.path.normcase(os.path.normpath(str(root)))
+
+
+def _migrate_canonical_roots(conn):
+    """Gop project trung canonical-root + canonicalize root/path (#P0-8). Chay 1 lan."""
+    import os
+    rows = conn.execute("SELECT id, root FROM projects ORDER BY id").fetchall()
+    active = _active_pid(conn)
+    orphan_dup_pids = []
+
+    # Gom theo canonical, giu id nho nhat
+    groups = {}
+    for r in rows:
+        groups.setdefault(_canon(r["root"]), []).append(r["id"])
+
+    for canon, ids in groups.items():
+        keep = ids[0]
+        # 1) Merge + xoa cac dup TRUOC (de giai phong root canonical)
+        for dup in ids[1:]:
+            for f in conn.execute("SELECT path FROM files WHERE project_id=?", (dup,)).fetchall():
+                p = f["path"]
+                if conn.execute("SELECT 1 FROM files WHERE project_id=? AND path=?", (keep, p)).fetchone():
+                    for t in ("symbols", "edges", "routes"):
+                        conn.execute(f"DELETE FROM {t} WHERE project_id=? AND file_path=?", (dup, p))
+                    conn.execute("DELETE FROM files WHERE project_id=? AND path=?", (dup, p))
+                else:
+                    conn.execute("UPDATE files SET project_id=?, vector_ok=0 WHERE project_id=? AND path=?",
+                                 (keep, dup, p))
+                    for t in ("symbols", "edges", "routes"):
+                        conn.execute(f"UPDATE {t} SET project_id=? WHERE project_id=? AND file_path=?",
+                                     (keep, dup, p))
+            conn.execute("DELETE FROM meta WHERE key=?", (f"overview:{dup}",))
+            conn.execute("DELETE FROM projects WHERE id=?", (dup,))
+            orphan_dup_pids.append(dup)
+            if active == dup:
+                active = keep
+
+        # 2) Canonicalize root cua keep (gio root canonical da trong)
+        cur = conn.execute("SELECT root FROM projects WHERE id=?", (keep,)).fetchone()
+        if cur and cur["root"] != canon:
+            conn.execute("UPDATE projects SET root=? WHERE id=?", (canon, keep))
+            for f in conn.execute("SELECT path FROM files WHERE project_id=?", (keep,)).fetchall():
+                np = os.path.normcase(f["path"])
+                if np != f["path"] and not conn.execute(
+                        "SELECT 1 FROM files WHERE project_id=? AND path=?", (keep, np)).fetchone():
+                    conn.execute("UPDATE files SET path=? WHERE project_id=? AND path=?",
+                                 (np, keep, f["path"]))
+                    for t in ("symbols", "edges", "routes"):
+                        conn.execute(f"UPDATE {t} SET file_path=? WHERE project_id=? AND file_path=?",
+                                     (np, keep, f["path"]))
+
+    if active is not None:
+        conn.execute("INSERT INTO meta(key,value) VALUES('active_project_id',?) "
+                     "ON CONFLICT(key) DO UPDATE SET value=?", (str(active), str(active)))
+    # Best-effort: don vector orphan cua dup pids
+    if orphan_dup_pids:
+        try:
+            from . import vectors
+            for dp in orphan_dup_pids:
+                vectors.delete_project(dp)
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -284,6 +360,17 @@ def set_vector_ok(path, ok, project_id):
     conn = _conn()
     conn.execute("UPDATE files SET vector_ok=? WHERE project_id=? AND path=?",
                  (1 if ok else 0, project_id, path))
+    conn.commit()
+    conn.close()
+
+
+def mark_all_vectors_stale(project_id=None):
+    """Danh dau vector can re-embed (vd doi embedding model) -> reconcile se sua."""
+    conn = _conn()
+    if project_id is None:
+        conn.execute("UPDATE files SET vector_ok=0")
+    else:
+        conn.execute("UPDATE files SET vector_ok=0 WHERE project_id=?", (project_id,))
     conn.commit()
     conn.close()
 
