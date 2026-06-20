@@ -229,5 +229,34 @@ Lệnh kiểm tra tối thiểu:
 ## CLAUDE_REPORT — temporary handoff
 
 <!-- CLAUDE_REPORT_START -->
-Claude Code: thay placeholder này bằng báo cáo của vòng triển khai mới. Không xóa marker.
+## Vòng — P0-5, P0-6, P0-8, P0-10 (round 3)
+
+**Commit:** work `90f1e6d` (report commit ngay sau). **Working tree:** clean sau report commit.
+**Env:** Python 3.12.13 (venv Ollama), chromadb 1.5.9, tree-sitter-language-pack, watchdog 6.0.0.
+
+### Task đã xử lý
+- **P0-10 (partial-result đáng tin):** tách `_client()`; phân biệt **absent** (collection không có → không gì để xoá = True) vs **unavailable/error** (client không mở được hoặc delete lỗi → **False**). `clear_all()` KHÔNG còn nuốt lỗi `delete_collection` rồi trả True oan (lỗi thật → False; "does not exist" → True). `/api/clear` + `/api/project/delete` trả partial result (`vector_cleared`/`vector_deleted`); `/api/clear` reset chat session.
+- **P0-8 (migration canonical root):** `_migrate_canonical_roots(conn)` (guard `meta.roots_canon_v1`, chạy 1 lần): gom project cùng `_canon(root)` (normcase/normpath/realpath — Windows casing/separator/junction), **merge** rows dup→keep (xử lý UNIQUE(project_id,path), set `vector_ok=0` để re-embed), dọn vector orphan của dup, rồi canonicalize root keep + normcase path. Sửa repro IDs [1,2] của Codex.
+- **P0-6 (serialize concurrency):** `INDEX_LOCK` (RLock) bọc `index_project`/`index_single_file`/`remove_file`/`reconcile_vectors` (decorator `_locked`) + `/api/clear` + `/api/project/delete`. Hai `/api/index` đồng thời → tuần tự; watcher flush (qua `index_single_file`) cũng serialize. RLock cho `reconcile_vectors` chạy lồng trong `index_project` cùng thread.
+- **P0-5 (embed-version + reconcile lifecycle):** lưu `meta.embed_model`; khi đổi embedding model → `mark_all_vectors_stale()` (vector_ok=0) → reconcile re-embed. Startup chạy `reconcile_vectors(active)` ở **background thread** (không chặn khởi động). Thêm `/api/reconcile` thủ công. `vector_ok` đã bền qua restart (cột SQLite).
+
+### File/API đã đổi
+- `codemem/storage/vectors.py`: `_client()`, `_delete_where()`, `delete_file/delete_project/clear_all` trả bool đúng absent/unavailable/error; `health()` qua `_client`.
+- `codemem/storage/db.py`: `_canon`, `_migrate_canonical_roots` (+guard); `mark_all_vectors_stale`.
+- `codemem/indexer/runner.py`: `INDEX_LOCK`+`_locked`; embed-model staleness check trong `index_project`.
+- `codemem/api/server.py`: `/api/reconcile`; INDEX_LOCK quanh clear/delete; startup background reconcile.
+
+### Test + kết quả
+- `python -m pytest tests -q` → **36 passed** (mới: canonical-root merge migration; partial-result absent/unavailable/error; clear_all semantics).
+- `python -m compileall -q codemem` pass; `node --check web/app.js` pass; server import **25 routes**.
+- Integration trên DB thật: migration chạy sạch (27 file, vector_pending 0), `health: chroma true/embedding ok`, `reconcile: repaired 0/pending 0`.
+
+### Partial / chưa làm (so với mô tả task)
+- **P0-5**: chưa có **inventory đối chiếu vector thực tế** (collection mất/corrupt bên ngoài khi DB vẫn vector_ok=1 → chưa tự phát hiện); summary-embedding chưa có trạng thái pending/version riêng; chưa lưu content-hash per vector. Mới làm: staleness theo embed-model + reconcile bền + startup/manual.
+- **P0-6**: `INDEX_LOCK` serialize ghi nặng, nhưng generation guard vẫn không dừng callback **đã qua bước copy pending và đang ghi** (chỉ chặn flush chưa chạy); summarizer chưa nằm trong lock (có thể ghi song song index — sẽ gắn P1-16). Chưa có structured job log/retry.
+- **P0-10**: chưa lưu **tombstone/retryable cleanup** khi vector delete fail sau SQLite delete (mới trả False + log); chưa có retry UI.
+- **P0-8**: migration chưa rekey vector IDs của project keep theo path đã normcase (dựa vào vector_ok=0 + reconcile để re-embed thay vì rekey tại chỗ); chưa có test junction thật.
+
+### Regression mới phát hiện
+- Không có regression với baseline 9af630e (36/36 pass, gồm toàn bộ test cũ). Bug ef-poison vòng trước vẫn fixed (health chroma true).
 <!-- CLAUDE_REPORT_END -->
