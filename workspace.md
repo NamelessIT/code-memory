@@ -28,11 +28,11 @@
 
 ## Baseline đã được Codex xác minh
 
-- Reviewed implementation commit: 5feef23; report commit: 1841877.
-- Full suite: 45 passed.
+- Reviewed implementation commit: 5599a9e; report commit: efe3999.
+- Full suite: 49 passed.
 - python -m compileall -q codemem: pass.
 - node --check web/app.js: pass.
-- P0 đã xác minh và đã xóa/thu gọn: typed absent-vs-error vector delete, project existence check trong INDEX_LOCK, clear stop-in-lock, roots_canon_v2 + overview invalidation, migration ghi cleanup intent thay vì gọi Chroma trong transaction, tombstone dedup/backoff/fair batching/health cơ bản và các fix vòng trước.
+- P0 đã xác minh và đã xóa/thu gọn: typed absent-vs-error vector delete, project existence check trong INDEX_LOCK, clear stop-in-lock, roots_canon_v2 + overview invalidation, tombstone v1 giữ row ở upgrade bình thường, outbox atomic cho file/project delete, retry API không phụ thuộc active project, error detail và các fix vòng trước.
 - Không được làm regression các phần trên.
 
 ## ACTIVE TASKS
@@ -42,6 +42,7 @@
 files.vector_ok, startup/manual/switch reconcile và embed-model marker đã có. Phần còn lại:
 
 - Reconcile chỉ thấy vector_ok=0; collection mất/corrupt bên ngoài trong khi DB còn 1 không được phát hiện.
+- **Codex repro:** upsert_file tạo file mới với vector_ok mặc định `1` trước khi bất kỳ vector write nào chạy; crash giữa SQLite upsert và embedding để lại `pending_repair=0`. Upsert/update phải set vector_ok=0 trong cùng transaction, chỉ set 1 sau vector add hoàn tất.
 - mark_all_vectors_stale áp dụng mọi project nhưng startup chỉ reconcile active; project khác chỉ repair khi được switch tới.
 - EMBED_MODEL đổi nhưng vẫn dùng collection cố định `code`; nếu model mới khác dimension/config, mark stale rồi add vào collection cũ có thể fail vĩnh viễn. Meta lại được cập nhật trước khi rebuild thành công.
 - Summary embeddings chưa có trạng thái pending/version/reconcile. Re-index file xóa cả summary vector qua delete_file nhưng reconcile chỉ add lại file/symbol vectors, nên summary vector có thể biến mất sau model-change repair.
@@ -65,19 +66,21 @@ roots_canon_v2, normcase dedup, overview invalidation và cleanup intent cùng t
 
 - Có backup/rollback hoặc recovery contract rõ cho schema/data migration.
 - Marker vẫn là boolean rời rạc thay vì migration version/ledger có transaction và diagnostics.
-- Test upgrade thực tế từ DB chỉ có roots_canon_v1=1, transaction rollback/process interruption, overview merge và junction thật/adapter deterministic.
+- Tombstone v1→v2 dùng executescript rename/create rồi copy/drop ngoài một transaction explicit. Crash sau create nhưng trước copy có thể để bảng v2 rỗng + v1 còn row; lần init sau thấy cột attempts và bỏ qua recovery.
+- Test upgrade thực tế từ DB chỉ có roots_canon_v1=1, schema migration interrupted (cả v1+v2 cùng tồn tại), transaction rollback/process interruption, overview merge và junction thật/adapter deterministic.
 
 ### P0-10 — Mutation SQLite/vector chưa có partial-result contract
 
-Typed absent/error, scope file/project/collection, dedup, backoff, fair batching, clear-wipe và health stats đã đạt. Các lỗi còn lại:
+Typed absent/error, scope file/project/collection, dedup/backoff, schema preserve bình thường, outbox file/project, retry endpoint và health stats đã đạt. Các lỗi còn lại:
 
-- **Schema upgrade làm mất intent:** init_db thấy bảng tombstone v1 thì DROP rồi CREATE, không copy row. Codex repro DB cũ có 1 pending → sau upgrade còn 0. Phải migrate bằng rename/create/`INSERT OR IGNORE SELECT COALESCE(...)`/drop trong transaction và test bảo toàn row.
-- **Chưa phải transactional outbox:** delete_file, delete_project và clear commit SQLite trước; chỉ add tombstone sau khi vector trả False. Process kill/exception giữa hai bước vẫn tạo orphan không có intent. Luôn ghi intent trong cùng transaction với SQLite mutation, commit, thực hiện vector delete, rồi ack/xóa intent khi thành công.
+- `/api/clear` vẫn chưa atomic-outbox: db.clear_all() commit trước, rồi db.add_tombstone("collection") mở transaction khác. Crash giữa hai call vẫn mất intent. clear_all phải wipe dữ liệu cũ **và insert collection intent trong cùng transaction**, sau đó vector clear + ack.
 - **Intent cũ có thể xóa vector mới:** tombstone chỉ định danh `(scope,pid,path)`, không có generation/content hash. File được tạo lại trong lúc backoff vẫn có thể bị retry cũ xóa; Codex repro cho thấy delete thành công nhưng DB vẫn `vector_ok=1`, `pending_repair=0`.
-- Collection tombstone có thể được retry ở cuối index_project (qua reconcile) và xóa collection vừa index; các file mới vẫn vector_ok=1. Cleanup collection phải chạy/fence trước mọi vector write hoặc đổi generation rồi mark/rebuild nhất quán.
-- Retry không có liveness độc lập: sau clear hoặc xóa project cuối, không còn active pid nên `/api/reconcile` trả 400 và startup không chạy reconcile; intent có thể nằm vĩnh viễn đến lần index sau. Thêm startup/background cleanup worker hoặc endpoint không phụ thuộc project.
-- `last_error` hiện luôn là chuỗi chung `vector delete failed`, không lưu nguyên nhân thực; chưa có updated_at/jitter/structured diagnostics.
-- Thêm test crash-window/outbox, migration v1 giữ row, delete→recreate-before-retry, clear-fail→index-new-project, last-project delete/restart và retry không active project; surface retry/action trong UI/job.
+- **Collection fence vẫn thủng khi backoff:** index_project chỉ gọi due_tombstones; intent collection chưa đến next_retry bị bỏ qua rồi vector mới vẫn được ghi. Codex repro: `vector_writes=1` trong khi `collection_intents_pending=1`; retry sau sẽ wipe vector mới mà DB vẫn vector_ok=1.
+- Filter scope được áp dụng **sau** SQL `LIMIT 50`; 50 intent scope khác có thể che collection intent dù nó đã due. due_tombstones phải filter scope trong SQL trước LIMIT.
+- `cleanup_worker` startup chỉ chạy **một lần rồi thoát**. Intent đang backoff lúc startup không tự chạy khi đến hạn; cần recurring scheduler có shutdown/cancel/backoff, hoặc job system P1-16. Endpoint thủ công không đủ liveness.
+- Collection/file cleanup cần generation/content hash hoặc supersession protocol: block/fence mọi write khi collection intent tồn tại (không chỉ due), xử lý cleanup trước write, và mark/rebuild vector_ok nhất quán sau collection clear.
+- Backoff chưa jitter/updated_at; UI chưa có pending/retry action.
+- Thêm test clear crash-window, delete→recreate-before-retry, collection intent future→index, >50 mixed scopes, startup-before-next_retry rồi chờ đến hạn, và retry xong DB/vector inventory phải khớp.
 
 ### P1-11 — Lexical retrieval và ranking
 
@@ -173,7 +176,7 @@ Typed absent/error, scope file/project/collection, dedup, backoff, fair batching
 Python và multi-project wording đã sửa. Còn:
 
 - Roadmap vẫn đánh dấu Phase 1–3 hoàn tất dù active tasks còn nhiều.
-- Tests section chưa phản ánh 40 tests và coverage multi-project/migration/vector mới.
+- Tests section chưa phản ánh 49 tests và coverage multi-project/migration/vector mới.
 - Bổ sung schema migration, degraded semantics, health, project lifecycle và giới hạn hiện tại.
 
 ### P2-23 — UI project/explorer
@@ -235,34 +238,5 @@ Lệnh kiểm tra tối thiểu:
 ## CLAUDE_REPORT — temporary handoff
 
 <!-- CLAUDE_REPORT_START -->
-## Vòng — P0-10 transactional outbox (kèm schema-preserve, project-independent worker, fence)
-
-**Commit:** work `5599a9e` (report commit ngay sau). **Working tree:** clean sau report.
-**Env:** Python 3.12.13 (venv Ollama), chromadb 1.5.9, watchdog 6.0.0.
-
-### Task đã xử lý (P0-10)
-- **Schema upgrade GIỮ row (repro 1→1):** v1→v2 không DROP mất dữ liệu nữa — `ALTER RENAME` → `CREATE` v2 → `INSERT OR IGNORE SELECT COALESCE(...)` → `DROP` bảng cũ. Test bảo toàn row.
-- **Transactional outbox:** `db.delete_file`/`db.delete_project` ghi cleanup intent **trong cùng transaction SQLite** với việc xoá row; caller gọi `vectors.delete_*` rồi `db.ack_tombstone(...)` khi thành công. Crash/exception giữa 2 bước → intent đã durable → worker dọn sau (hết orphan-không-intent). `/api/clear`: `add_tombstone("collection")` **trước** `vectors.clear_all()`, ack khi ok.
-- **Project-independent cleanup:** `runner.cleanup_worker()` retry mọi scope không cần active project; `/api/cleanup/retry` endpoint + chạy ở **startup background** → intent được dọn kể cả sau khi clear/xoá hết project (trước đây `/api/reconcile` trả 400, intent kẹt vĩnh viễn).
-- **Collection fence:** `index_project` xử lý collection intent **trước** khi ghi vector; reconcile sau index dùng `include_collection=False` → không wipe collection vừa index. Test `scopes` filter.
-- **last_error thật:** `vectors.last_error()` (get_collection/delete/clear lưu message) → `record_tombstone_failure(id, err)` thay vì chuỗi chung.
-
-### File/API đã đổi
-- `codemem/storage/db.py`: schema v1→v2 preserve; `delete_file`/`delete_project` ghi intent atomic; `ack_tombstone`.
-- `codemem/storage/vectors.py`: `last_error()` + set `_last_error` ở delete/clear failures.
-- `codemem/indexer/runner.py`: `_retry_tombstones(scopes=)`, `cleanup_worker()`, `reconcile_vectors(include_collection=)`, index fence + ack outbox.
-- `codemem/api/server.py`: `/api/cleanup/retry`; `/api/clear` outbox; delete ack; startup cleanup worker.
-
-### Test + kết quả
-- `python -m pytest tests -q` → **49 passed** (mới: schema-v1-preserve, outbox delete_file/project intent+ack, cleanup_worker independent, scopes-filter fence, collapse-then-project-intent, real last_error). `compileall` + `node --check` pass; **26 routes**.
-- Live smoke: `/api/health` → `cleanup:{pending,failed,last_error}`; `/api/cleanup/retry` → 200 `{cleared, cleanup}`. Real DB intact 27 file / vector_pending 0.
-
-### Partial / chưa làm
-- **P0-10 còn lại — generation/content-hash trên intent:** tombstone vẫn chỉ `(scope,pid,path)`, **chưa có generation/hash** → file được re-index trong lúc backoff vẫn có thể bị intent cũ xoá vector mới (Codex repro delete-success-nhưng-vector_ok=1 chưa fix). Cần gắn generation/hash vào intent + so khớp trước khi xoá. Backoff chưa có jitter; chưa surface retry/action trong **UI**.
-- **P0-8**: vẫn marker boolean (`roots_canon_v2`) — chưa migration-version/ledger + backup/rollback; chưa test junction thật + process-interruption giữa transform và retry.
-- **P0-6**: generation guard chưa hủy callback đang ghi dở; chưa **re-check project-exists sau khi lấy INDEX_LOCK** trong watcher callback (callback cũ vẫn có thể ghi cho pid đã xoá); **summarizer vẫn ngoài lock**; chưa có deterministic API-concurrency test. → P1-16.
-- **P0-5**: collection generation theo embed-model (dimension/config) + inventory/content-hash + summary-embedding version vẫn chưa làm.
-
-### Regression
-- Không. 49/49 pass; health chroma true; DB thật nguyên vẹn.
+Claude Code: thay nội dung này bằng báo cáo triển khai mới sau khi hoàn thành task.
 <!-- CLAUDE_REPORT_END -->

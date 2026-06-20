@@ -31,7 +31,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             project_id INTEGER, path TEXT,
             lang TEXT, hash TEXT, skeleton TEXT, indexed_at TEXT, summary TEXT DEFAULT '',
-            vector_ok INTEGER DEFAULT 1,
+            vector_ok INTEGER DEFAULT 1, vector_gen INTEGER DEFAULT 0,
             UNIQUE(project_id, path)
         );
         CREATE TABLE IF NOT EXISTS symbols (
@@ -65,16 +65,26 @@ def init_db():
             attempts INTEGER NOT NULL DEFAULT 0,
             last_error TEXT DEFAULT '',
             next_retry TEXT DEFAULT '',
+            generation INTEGER NOT NULL DEFAULT 0,
             created_at TEXT,
             UNIQUE(scope, project_id, file_path)
         );
     """)
-    # Upgrade vector_tombstones v1 -> v2 GIU LAI row pending (#P0-10): rename/create/insert-select/drop
+    # Upgrade vector_tombstones v1 -> v2 GIU row pending, ATOMIC trong transaction init_db (#P0-10/#P0-8).
+    # KHONG dung executescript (auto-commit giua cau) de crash khong de bang lech.
+    now = datetime.now().isoformat()
+    tables = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    # Recovery: migration truoc bi gian doan -> con bang _v1. Copy not vao v2 roi drop.
+    if "vector_tombstones_v1" in tables:
+        conn.execute(
+            "INSERT OR IGNORE INTO vector_tombstones(scope, project_id, file_path, next_retry, created_at) "
+            "SELECT COALESCE(scope,'file'), COALESCE(project_id,0), COALESCE(file_path,''), ?, COALESCE(created_at,?) "
+            "FROM vector_tombstones_v1", (now, now))
+        conn.execute("DROP TABLE vector_tombstones_v1")
     tcols = [r["name"] for r in conn.execute("PRAGMA table_info(vector_tombstones)")]
-    if "attempts" not in tcols:
-        now = datetime.now().isoformat()
-        conn.executescript("""
-            ALTER TABLE vector_tombstones RENAME TO vector_tombstones_v1;
+    if "attempts" not in tcols:        # bang hien tai con schema v1 -> nang cap atomic
+        conn.execute("ALTER TABLE vector_tombstones RENAME TO vector_tombstones_v1")
+        conn.execute("""
             CREATE TABLE vector_tombstones (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 scope TEXT NOT NULL,
@@ -83,10 +93,10 @@ def init_db():
                 attempts INTEGER NOT NULL DEFAULT 0,
                 last_error TEXT DEFAULT '',
                 next_retry TEXT DEFAULT '',
+                generation INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT,
                 UNIQUE(scope, project_id, file_path)
-            );
-        """)
+            )""")
         conn.execute(
             "INSERT OR IGNORE INTO vector_tombstones(scope, project_id, file_path, next_retry, created_at) "
             "SELECT COALESCE(scope,'file'), COALESCE(project_id,0), COALESCE(file_path,''), ?, COALESCE(created_at,?) "
@@ -99,7 +109,9 @@ def init_db():
         "ALTER TABLE symbols ADD COLUMN body TEXT DEFAULT ''",
         "ALTER TABLE files ADD COLUMN summary TEXT DEFAULT ''",
         "ALTER TABLE files ADD COLUMN vector_ok INTEGER DEFAULT 1",
+        "ALTER TABLE files ADD COLUMN vector_gen INTEGER DEFAULT 0",
         "ALTER TABLE files ADD COLUMN project_id INTEGER",
+        "ALTER TABLE vector_tombstones ADD COLUMN generation INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE symbols ADD COLUMN project_id INTEGER",
         "ALTER TABLE edges ADD COLUMN project_id INTEGER",
         "ALTER TABLE routes ADD COLUMN project_id INTEGER",
@@ -368,14 +380,23 @@ def get_indexed_hashes(project_id) -> dict:
 
 
 def upsert_file(path, lang, file_hash, skeleton, symbols, edges=None, routes=None, project_id=None):
+    """Ghi file vao SQLite. vector_ok=0 + bump vector_gen TRONG CUNG transaction (#P0-5/#P0-10):
+    - crash giua upsert va embedding -> vector_ok=0 (reconcile se sua), khong bao gia 'da co vector'.
+    - vector_gen tang don dieu -> intent xoa cu (gen thap) khong xoa vector moi (gen cao).
+    Tra ve generation de caller tag vector."""
     conn = _conn()
     now = datetime.now().isoformat()
+    grow = conn.execute("SELECT value FROM meta WHERE key='vec_gen_seq'").fetchone()
+    gen = (int(grow["value"]) if grow and grow["value"] else 0) + 1
+    conn.execute("INSERT INTO meta(key,value) VALUES('vec_gen_seq',?) "
+                 "ON CONFLICT(key) DO UPDATE SET value=?", (str(gen), str(gen)))
     # Identity = (project_id, path) -> project long nhau khong ghi de nhau
     conn.execute(
-        "INSERT INTO files(project_id, path, lang, hash, skeleton, indexed_at, summary) "
-        "VALUES (?,?,?,?,?,?,'') "
-        "ON CONFLICT(project_id, path) DO UPDATE SET lang=?, hash=?, skeleton=?, indexed_at=?, summary=''",
-        (project_id, path, lang, file_hash, skeleton, now, lang, file_hash, skeleton, now),
+        "INSERT INTO files(project_id, path, lang, hash, skeleton, indexed_at, summary, vector_ok, vector_gen) "
+        "VALUES (?,?,?,?,?,?,'',0,?) "
+        "ON CONFLICT(project_id, path) DO UPDATE SET lang=?, hash=?, skeleton=?, indexed_at=?, "
+        "summary='', vector_ok=0, vector_gen=?",
+        (project_id, path, lang, file_hash, skeleton, now, gen, lang, file_hash, skeleton, now, gen),
     )
     conn.execute("DELETE FROM symbols WHERE project_id=? AND file_path=?", (project_id, path))
     conn.executemany(
@@ -397,21 +418,28 @@ def upsert_file(path, lang, file_hash, skeleton, symbols, edges=None, routes=Non
     conn.execute("DELETE FROM meta WHERE key=?", (f"overview:{project_id}",))
     conn.commit()
     conn.close()
+    return gen
 
 
 def delete_file(path, project_id=None):
-    """Xoa file khoi SQLite + ghi cleanup intent vector trong CUNG transaction (outbox #P0-10).
+    """Xoa file khoi SQLite + ghi cleanup intent vector (kem generation) trong CUNG transaction (outbox #P0-10).
     Caller goi vectors.delete_file roi ack_tombstone khi thanh cong."""
     conn = _conn()
     pid = project_id if project_id is not None else _active_pid(conn)
+    grow = conn.execute("SELECT vector_gen FROM files WHERE project_id=? AND path=?", (pid, path)).fetchone()
+    gen = grow["vector_gen"] if grow else 0
     for t in ("symbols", "edges", "routes"):
         conn.execute(f"DELETE FROM {t} WHERE project_id=? AND file_path=?", (pid, path))
     conn.execute("DELETE FROM files WHERE project_id=? AND path=?", (pid, path))
     if pid is not None:
         conn.execute("DELETE FROM meta WHERE key=?", (f"overview:{pid}",))  # invalidate overview
     now = datetime.now().isoformat()
-    conn.execute("INSERT OR IGNORE INTO vector_tombstones(scope, project_id, file_path, next_retry, created_at) "
-                 "VALUES ('file',?,?,?,?)", (pid or 0, path, now, now))
+    # Intent kem generation: retry chi xoa vector co gen <= gen nay (khong xoa vector moi sau re-index)
+    conn.execute("INSERT INTO vector_tombstones(scope, project_id, file_path, next_retry, created_at, generation) "
+                 "VALUES ('file',?,?,?,?,?) "
+                 "ON CONFLICT(scope,project_id,file_path) DO UPDATE SET generation=MAX(generation,excluded.generation), "
+                 "next_retry=excluded.next_retry, attempts=0",
+                 (pid or 0, path, now, now, gen))
     conn.commit()
     conn.close()
 
@@ -467,13 +495,27 @@ def add_tombstones_bulk(conn, items):
         [(s, p or 0, fp or "", now, now) for (s, p, fp) in items])
 
 
-def due_tombstones(limit=50):
-    """Cac intent den han (next_retry <= now), uu tien han som nhat -> chong starvation (#P0-10)."""
+def due_tombstones(limit=50, scopes=None):
+    """Intent den han (next_retry <= now), uu tien han som nhat. Filter scope TRONG SQL truoc LIMIT
+    -> intent scope khac khong che mat scope can (#P0-10)."""
     conn = _conn()
     now = datetime.now().isoformat()
-    rows = conn.execute(
-        "SELECT * FROM vector_tombstones WHERE next_retry <= ? ORDER BY next_retry, id LIMIT ?",
-        (now, limit)).fetchall()
+    sql = "SELECT * FROM vector_tombstones WHERE next_retry <= ?"
+    params = [now]
+    if scopes:
+        sql += " AND scope IN (%s)" % ",".join("?" * len(scopes))
+        params += list(scopes)
+    sql += " ORDER BY next_retry, id LIMIT ?"
+    params.append(limit)
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def tombstones_by_scope(scope):
+    """TAT CA intent cua scope (KE CA chua den han) -> dung cho fence (#P0-10)."""
+    conn = _conn()
+    rows = conn.execute("SELECT * FROM vector_tombstones WHERE scope=? ORDER BY id", (scope,)).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
@@ -524,7 +566,7 @@ def files_pending_vector(project_id):
     """File co trong SQLite nhung vector chua thanh cong -> can repair (#P0-5)."""
     conn = _conn()
     rows = conn.execute(
-        "SELECT path, lang, skeleton FROM files WHERE project_id=? AND COALESCE(vector_ok,1)=0",
+        "SELECT path, lang, skeleton, vector_gen FROM files WHERE project_id=? AND COALESCE(vector_ok,1)=0",
         (project_id,)).fetchall()
     conn.close()
     return [dict(r) for r in rows]
@@ -649,12 +691,17 @@ def get_routes(limit=300, project_id=None):
     return [dict(r) for r in rows]
 
 
-def clear_all():
-    """Xoa SACH toan bo (moi project). Dung cho /api/clear va test."""
+def clear_all(add_collection_intent=False):
+    """Xoa SACH toan bo (moi project). add_collection_intent: ghi collection-intent TRONG CUNG
+    transaction voi wipe (outbox atomic cho /api/clear #P0-10)."""
     init_db()
     conn = _conn()
     for t in ("symbols", "edges", "routes", "files", "projects", "meta", "vector_tombstones"):
         conn.execute(f"DELETE FROM {t}")
+    if add_collection_intent:
+        now = datetime.now().isoformat()
+        conn.execute("INSERT INTO vector_tombstones(scope, project_id, file_path, next_retry, created_at) "
+                     "VALUES ('collection',0,'',?,?)", (now, now))
     conn.commit()
     conn.execute("VACUUM")
     conn.close()

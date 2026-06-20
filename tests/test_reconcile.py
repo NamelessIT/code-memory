@@ -34,11 +34,11 @@ def test_reconcile_still_pending_on_failure(monkeypatch):
 
 def test_retry_tombstones_clears_on_success(monkeypatch):
     # #P0-10: retry thanh cong moi scope -> xoa khoi danh sach
-    tombs = [{"id": 1, "scope": "file", "project_id": 2, "file_path": "/p/a.py"},
+    tombs = [{"id": 1, "scope": "file", "project_id": 2, "file_path": "/p/a.py", "generation": 4},
              {"id": 2, "scope": "project", "project_id": 3, "file_path": ""},
              {"id": 3, "scope": "collection", "project_id": 0, "file_path": ""}]
-    monkeypatch.setattr(runner.db, "due_tombstones", lambda batch=50: tombs)
-    monkeypatch.setattr(runner.vectors, "delete_file", lambda p, project_id=None: True)
+    monkeypatch.setattr(runner.db, "due_tombstones", lambda batch=50, scopes=None: tombs)
+    monkeypatch.setattr(runner.vectors, "delete_file", lambda p, project_id=None, generation=None: True)
     monkeypatch.setattr(runner.vectors, "delete_project", lambda pid: True)
     monkeypatch.setattr(runner.vectors, "clear_all", lambda: True)
     deleted = []
@@ -50,8 +50,8 @@ def test_retry_tombstones_clears_on_success(monkeypatch):
 def test_retry_tombstones_backoff_on_failure(monkeypatch):
     # #P0-10: fail -> record_tombstone_failure (backoff), KHONG del
     monkeypatch.setattr(runner.db, "due_tombstones",
-                        lambda batch=50: [{"id": 1, "scope": "file", "project_id": 2, "file_path": "/p/a.py"}])
-    monkeypatch.setattr(runner.vectors, "delete_file", lambda p, project_id=None: False)
+                        lambda batch=50, scopes=None: [{"id": 1, "scope": "file", "project_id": 2, "file_path": "/p/a.py", "generation": 1}])
+    monkeypatch.setattr(runner.vectors, "delete_file", lambda p, project_id=None, generation=None: False)
     failed = []
     monkeypatch.setattr(runner.db, "record_tombstone_failure", lambda tid, err="": failed.append(tid))
     monkeypatch.setattr(runner.db, "del_tombstone",
@@ -63,7 +63,7 @@ def test_retry_tombstones_backoff_on_failure(monkeypatch):
 def test_cleanup_worker_independent_of_project(monkeypatch):
     # #P0-10: cleanup_worker retry moi scope, KHONG can active project
     monkeypatch.setattr(runner.db, "due_tombstones",
-                        lambda batch=50: [{"id": 1, "scope": "project", "project_id": 9, "file_path": ""}])
+                        lambda batch=50, scopes=None: [{"id": 1, "scope": "project", "project_id": 9, "file_path": ""}])
     monkeypatch.setattr(runner.vectors, "delete_project", lambda pid: True)
     deleted = []
     monkeypatch.setattr(runner.db, "del_tombstone", lambda tid: deleted.append(tid))
@@ -72,10 +72,12 @@ def test_cleanup_worker_independent_of_project(monkeypatch):
 
 def test_retry_scopes_filter_excludes_collection(monkeypatch):
     # #P0-10 fence: scopes={'file'} -> KHONG dung clear_all (collection bo qua)
-    tombs = [{"id": 1, "scope": "file", "project_id": 2, "file_path": "/a"},
+    tombs = [{"id": 1, "scope": "file", "project_id": 2, "file_path": "/a", "generation": 1},
              {"id": 2, "scope": "collection", "project_id": 0, "file_path": ""}]
-    monkeypatch.setattr(runner.db, "due_tombstones", lambda batch=50: tombs)
-    monkeypatch.setattr(runner.vectors, "delete_file", lambda p, project_id=None: True)
+    # due_tombstones filter scope trong SQL -> fake phai ton trong scopes
+    monkeypatch.setattr(runner.db, "due_tombstones",
+                        lambda batch=50, scopes=None: [t for t in tombs if scopes is None or t["scope"] in scopes])
+    monkeypatch.setattr(runner.vectors, "delete_file", lambda p, project_id=None, generation=None: True)
     cleared_collection = []
     monkeypatch.setattr(runner.vectors, "clear_all", lambda: cleared_collection.append(1) or True)
     monkeypatch.setattr(runner.db, "del_tombstone", lambda tid: None)

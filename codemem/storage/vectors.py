@@ -114,11 +114,16 @@ def _delete_where(where):
         return False
 
 
-def delete_file(path, project_id=None):
-    """Xoa vector 1 file. Co project_id -> chi xoa trong project do (#P0-8)."""
+def delete_file(path, project_id=None, generation=None):
+    """Xoa vector 1 file. project_id -> chi trong project do (#P0-8); generation -> CHI xoa vector
+    gen <= generation (intent cu khong xoa vector moi sau re-index #P0-10)."""
+    conds = [{"file_path": path}]
     if project_id is not None:
-        return _delete_where({"$and": [{"file_path": path}, {"project_id": project_id}]})
-    return _delete_where({"file_path": path})
+        conds.append({"project_id": project_id})
+    if generation is not None:
+        conds.append({"generation": {"$lte": generation}})
+    where = conds[0] if len(conds) == 1 else {"$and": conds}
+    return _delete_where(where)
 
 
 def delete_project(project_id):
@@ -148,13 +153,13 @@ def clear_all():
     return ok
 
 
-def index_file(path, lang, skeleton, symbols, project_id=None):
+def index_file(path, lang, skeleton, symbols, project_id=None, generation=0):
     col = get_collection()
     if col is None:
         return False                       # lexical mode: bo qua vector (van index SQLite)
     delete_file(path, project_id=project_id)   # chi xoa vector cu cua dung project nay
     docs, metas, ids = [], [], []
-    base = {"file_path": path, "lang": lang, "project_id": project_id}
+    base = {"file_path": path, "lang": lang, "project_id": project_id, "generation": generation}
     docs.append(skeleton)
     metas.append({**base, "kind": "file", "name": path})
     ids.append(f"{project_id}::{path}::file")

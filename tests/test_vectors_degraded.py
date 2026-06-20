@@ -57,6 +57,15 @@ def test_delete_file_no_project_filter(monkeypatch):
     assert fc.deleted[0] == {"file_path": "/p/x.py"}
 
 
+def test_delete_file_with_generation_filter(monkeypatch):
+    # #P0-10: generation -> chi xoa vector gen <= generation (intent cu khong xoa vector moi)
+    fc = _FakeCol()
+    monkeypatch.setattr(vec, "_client", lambda: _FakeClient(fc))
+    vec.delete_file("/p/x.py", project_id=2, generation=5)
+    conds = fc.deleted[0]["$and"]
+    assert {"generation": {"$lte": 5}} in conds and {"project_id": 2} in conds
+
+
 def test_delete_unavailable_returns_false(monkeypatch):
     # #P0-10: client khong mo duoc -> KHONG dam bao da xoa -> False
     monkeypatch.setattr(vec, "_client", lambda: None)

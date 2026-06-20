@@ -60,6 +60,64 @@ def test_delete_file_writes_intent_then_ack(tmp_path, monkeypatch):
     assert db.tombstone_stats()["pending"] == 0
 
 
+def test_upsert_sets_vector_ok_zero(tmp_path, monkeypatch):
+    # #P0-5: upsert_file set vector_ok=0 (crash-safe: chua co vector)
+    _fresh(tmp_path, monkeypatch)
+    pid = db.get_or_create_project("/r", "R")
+    db.upsert_file("/r/x.py", "python", "h", "s", [], project_id=pid)
+    assert len(db.files_pending_vector(pid)) == 1
+
+
+def test_delete_intent_carries_generation(tmp_path, monkeypatch):
+    # #P0-10: intent xoa mang generation; re-index bump gen cao hon -> intent cu khong dung vector moi
+    _fresh(tmp_path, monkeypatch)
+    pid = db.get_or_create_project("/r", "R")
+    g1 = db.upsert_file("/r/x.py", "python", "h1", "s", [], project_id=pid)
+    db.delete_file("/r/x.py", project_id=pid)
+    t = db.due_tombstones()[0]
+    assert t["scope"] == "file" and t["generation"] == g1
+    g2 = db.upsert_file("/r/x.py", "python", "h2", "s", [], project_id=pid)
+    assert g2 > g1
+
+
+def test_clear_with_collection_intent_atomic(tmp_path, monkeypatch):
+    # #P0-10: clear_all(add_collection_intent=True) wipe + ghi collection intent trong 1 transaction
+    _fresh(tmp_path, monkeypatch)
+    db.add_tombstone("file", 1, "/a")
+    db.clear_all(add_collection_intent=True)
+    due = db.due_tombstones()
+    assert len(due) == 1 and due[0]["scope"] == "collection"
+
+
+def test_due_scope_filter_in_sql(tmp_path, monkeypatch):
+    # #P0-10: filter scope trong SQL truoc LIMIT -> collection khong bi che boi file intents
+    _fresh(tmp_path, monkeypatch)
+    for i in range(5):
+        db.add_tombstone("file", 1, f"/a{i}")
+    db.add_tombstone("collection")
+    got = db.due_tombstones(limit=1, scopes={"collection"})
+    assert len(got) == 1 and got[0]["scope"] == "collection"
+
+
+def test_interrupted_migration_recovery(tmp_path, monkeypatch):
+    # #P0-8: con bang _v1 (migration gian doan) -> init_db recovery copy row + drop _v1
+    import sqlite3
+    p = tmp_path / "i.db"
+    monkeypatch.setattr(db, "DB_PATH", p)
+    db.init_db()
+    c = sqlite3.connect(str(p))
+    c.execute("CREATE TABLE vector_tombstones_v1 (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+              "project_id INTEGER, file_path TEXT, scope TEXT, created_at TEXT)")
+    c.execute("INSERT INTO vector_tombstones_v1(project_id,file_path,scope,created_at) VALUES (3,'/r/a.py','file','t')")
+    c.commit(); c.close()
+    db.init_db()                                   # recovery
+    assert any(t["file_path"] == "/r/a.py" for t in db.due_tombstones())
+    c = sqlite3.connect(str(p))
+    tbls = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    c.close()
+    assert "vector_tombstones_v1" not in tbls       # da drop
+
+
 def test_schema_v1_upgrade_preserves_rows(tmp_path, monkeypatch):
     # #P0-10: nang cap bang tombstone v1 -> v2 GIU LAI row pending (Codex repro 1->1, khong mat)
     import sqlite3

@@ -34,8 +34,8 @@ def _index_one(spath, lang, h, root, pid, progress=None):
     rel = os.path.relpath(spath, root).replace("\\", "/")
     r = parse_file(content, lang, rel)
     skeleton = build_skeleton(rel, r["symbols"], r["imports"])
-    db.upsert_file(spath, lang, h, skeleton, r["symbols"], r["edges"], r["routes"], project_id=pid)
-    vec_ok = vectors.index_file(spath, lang, skeleton, r["symbols"], project_id=pid)
+    gen = db.upsert_file(spath, lang, h, skeleton, r["symbols"], r["edges"], r["routes"], project_id=pid)
+    vec_ok = vectors.index_file(spath, lang, skeleton, r["symbols"], project_id=pid, generation=gen)
     db.set_vector_ok(spath, vec_ok, pid)   # vector that bai -> danh dau de reconcile sau
     if progress:
         progress(f"indexed {spath} ({len(r['symbols'])} symbols, vector={'ok' if vec_ok else 'pending'})")
@@ -53,18 +53,18 @@ def ensure_embed_current():
 
 
 def _retry_tombstones(batch=50, scopes=None):
-    """Retry cleanup intent den han (fair batching + backoff). scopes=None -> moi scope (#P0-10)."""
+    """Retry cleanup intent den han (fair batching + backoff). Filter scope TRONG SQL (#P0-10).
+    File-scope dung generation -> khong xoa vector moi sau re-index."""
     cleared = 0
-    for t in db.due_tombstones(batch):
+    for t in db.due_tombstones(batch, scopes=scopes):
         scope = t["scope"]
-        if scopes is not None and scope not in scopes:
-            continue
         if scope == "collection":
             ok = vectors.clear_all()
         elif scope == "project":
             ok = vectors.delete_project(t["project_id"])
         else:
-            ok = vectors.delete_file(t["file_path"], project_id=t["project_id"])
+            ok = vectors.delete_file(t["file_path"], project_id=t["project_id"],
+                                     generation=t.get("generation"))
         if ok:
             db.del_tombstone(t["id"])
             cleared += 1
@@ -90,7 +90,8 @@ def reconcile_vectors(pid, progress=None, include_collection=True):
     repaired = still_pending = 0
     for f in db.files_pending_vector(pid):
         syms = db.get_symbols_for_file(f["path"], project_id=pid)
-        ok = vectors.index_file(f["path"], f["lang"], f["skeleton"] or "", syms, project_id=pid)
+        ok = vectors.index_file(f["path"], f["lang"], f["skeleton"] or "", syms,
+                                project_id=pid, generation=f.get("vector_gen", 0))
         db.set_vector_ok(f["path"], ok, pid)
         if ok:
             repaired += 1
@@ -110,9 +111,13 @@ def index_project(root: str, progress=None):
     pid = db.get_or_create_project(root)
     db.set_active_project(pid)
 
-    # Fence (#P0-10): xu ly collection-clear intent dang cho TRUOC khi ghi vector moi,
-    # de khong index xong roi bi collection-wipe xoa mat.
-    _retry_tombstones(scopes={"collection"})
+    # Fence (#P0-10): xu ly MOI collection-clear intent (ke ca chua den han) TRUOC khi ghi vector,
+    # neu khong index xong se bi collection-wipe xoa mat. Fail -> abort index (khong ghi vao trang thai lech).
+    for t in db.tombstones_by_scope("collection"):
+        if vectors.clear_all():
+            db.del_tombstone(t["id"])
+        else:
+            raise RuntimeError("collection cleanup dang cho va xoa vector that bai; huy index de tranh lech")
 
     existing = db.get_indexed_hashes(pid)
     seen = set()
