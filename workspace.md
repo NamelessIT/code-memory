@@ -238,5 +238,36 @@ Lệnh kiểm tra tối thiểu:
 ## CLAUDE_REPORT — temporary handoff
 
 <!-- CLAUDE_REPORT_START -->
-Claude Code: thay nội dung này bằng báo cáo triển khai mới sau khi hoàn thành task.
+## Vòng — generation guard + crash-safe vector_ok + atomic clear + fence-force + migration recovery
+
+**Commit:** work `aced57c` (report commit ngay sau). **Working tree:** clean sau report.
+**Env:** Python 3.12.13 (venv Ollama), chromadb 1.5.9, watchdog 6.0.0.
+
+### Task đã xử lý
+- **P0-5 (crash-safe vector_ok):** `upsert_file` set `vector_ok=0` + bump `vector_gen` **trong cùng transaction** với ghi row. Crash giữa upsert và embedding → `vector_ok=0` (reconcile sửa), không còn `pending_repair=0` sai (Codex repro). Trả `generation` cho caller tag vector. `_index_one` set `vector_ok=1` chỉ sau khi `vectors.index_file` xong.
+- **P0-10 generation guard (intent cũ không xoá vector mới):** `vec_gen_seq` (global monotonic) → `files.vector_gen`; vector metadata `generation`; `vector_tombstones.generation`. `delete_file` ghi intent kèm gen hiện tại; retry `vectors.delete_file(..., generation)` chỉ xoá vector `generation <= intent.gen` (`$lte`). File re-index trong lúc backoff (gen cao hơn) → vector mới **không** bị intent cũ xoá.
+- **P0-10 clear atomic:** `clear_all(add_collection_intent=True)` wipe + ghi collection-intent **cùng transaction**; `/api/clear` → clear_all(intent) → `vectors.clear_all` → ack. Crash giữa wipe và intent không còn mất intent.
+- **P0-10 due scope filter trong SQL:** `due_tombstones(limit, scopes)` lọc scope **trước LIMIT** → collection intent không bị 50 file-intent che (Codex repro starvation).
+- **P0-10 collection fence force:** `index_project` xử lý **mọi** collection intent (`tombstones_by_scope`, kể cả chưa đến hạn) trước khi ghi vector; clear fail → `raise` abort index (không ghi vào trạng thái lệch).
+- **P0-8 migration atomic + recovery:** tombstone v1→v2 dùng `conn.execute` trong transaction `init_db` (bỏ `executescript` auto-commit) → all-or-nothing; thêm **recovery**: bảng `vector_tombstones_v1` sót (migration gián đoạn) → copy row vào v2 + drop.
+
+### File/API đã đổi
+- `codemem/storage/db.py`: `files.vector_gen` + `vector_tombstones.generation` (CREATE+ALTER); `upsert_file` (vector_ok=0 + gen, return gen); `delete_file` (intent + gen, UPSERT MAX gen); `due_tombstones(scopes)` SQL filter; `tombstones_by_scope`; `clear_all(add_collection_intent)`; migration atomic + `_v1` recovery; `files_pending_vector` kèm vector_gen.
+- `codemem/storage/vectors.py`: `index_file(generation)` metadata; `delete_file(generation)` `$lte`.
+- `codemem/indexer/runner.py`: `_index_one` tag gen; reconcile re-embed dùng vector_gen; `_retry_tombstones` due-scope-SQL + gen; fence force.
+- `codemem/api/server.py`: `/api/clear` atomic intent + ack.
+
+### Test + kết quả
+- `python -m pytest tests -q` → **55 passed** (mới: generation carry/monotonic, vector_ok=0 on upsert, clear-atomic-intent, due-scope-SQL, interrupted-migration-recovery, vectors delete `$lte` generation).
+- `compileall` + `node --check` pass; **26 routes**; real DB migrated (`vector_gen`/`generation`), intact 27 file / vector_pending 0 / cleanup sạch.
+
+### Partial / chưa làm
+- **P0-5**: vẫn **chưa có inventory/content-hash** đối chiếu vector thực tế (collection mất/corrupt ngoài khi DB vector_ok=1); chưa có **collection generation theo embed-model dimension/config** (đổi sang model khác dimension vẫn add vào collection `code` cũ → có thể fail; mới mark-stale-reembed, chưa rebuild collection mới); summary-embedding chưa có version riêng; startup chỉ reconcile active project.
+  - **Migration note:** 27 file cũ có `vector_gen=0` + vector **không có** metadata `generation` (index trước thay đổi này); nếu sau này bị delete-by-generation thì where `$lte` không khớp doc thiếu field → orphan. Reindex sẽ chuẩn hoá. Không ảnh hưởng vận hành thường.
+- **P0-6**: generation guard (watcher) chưa hủy callback đang ghi dở; chưa re-check project-exists trong callback sau lock; **summarizer vẫn ngoài INDEX_LOCK**; chưa có deterministic API-concurrency test → **P1-16**.
+- **P0-10**: backoff chưa jitter/updated_at; cleanup_worker startup chạy **một lần** (chưa recurring scheduler — intent đang backoff lúc startup chờ tới lần index/endpoint kế); chưa surface retry/action trong **UI**.
+- **P0-8**: vẫn marker boolean (`roots_canon_v2`) — chưa migration-version/ledger + backup/rollback formal; chưa test junction thật.
+
+### Regression
+- Không. 55/55 pass; health chroma true; DB thật nguyên vẹn.
 <!-- CLAUDE_REPORT_END -->
