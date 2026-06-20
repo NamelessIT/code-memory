@@ -28,9 +28,10 @@ def init_db():
             last_indexed_at TEXT
         );
         CREATE TABLE IF NOT EXISTS files (
-            path TEXT PRIMARY KEY,
-            project_id INTEGER,
-            lang TEXT, hash TEXT, skeleton TEXT, indexed_at TEXT, summary TEXT DEFAULT ''
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER, path TEXT,
+            lang TEXT, hash TEXT, skeleton TEXT, indexed_at TEXT, summary TEXT DEFAULT '',
+            UNIQUE(project_id, path)
         );
         CREATE TABLE IF NOT EXISTS symbols (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -69,6 +70,22 @@ def init_db():
             conn.execute(stmt)
         except sqlite3.OperationalError:
             pass
+
+    # Migrate files PK path-global (cu) -> composite (project_id, path) cho nested project
+    fcols = [r["name"] for r in conn.execute("PRAGMA table_info(files)")]
+    if "id" not in fcols:
+        conn.executescript("""
+            CREATE TABLE files_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER, path TEXT,
+                lang TEXT, hash TEXT, skeleton TEXT, indexed_at TEXT, summary TEXT DEFAULT '',
+                UNIQUE(project_id, path)
+            );
+            INSERT INTO files_new(project_id, path, lang, hash, skeleton, indexed_at, summary)
+                SELECT project_id, path, lang, hash, skeleton, indexed_at, COALESCE(summary,'') FROM files;
+            DROP TABLE files;
+            ALTER TABLE files_new RENAME TO files;
+        """)
 
     # Migrate du lieu single-project cu -> 1 project
     has_proj = conn.execute("SELECT COUNT(*) c FROM projects").fetchone()["c"]
@@ -133,8 +150,19 @@ def list_projects():
     return out
 
 
+def project_exists(pid):
+    conn = _conn()
+    ok = conn.execute("SELECT 1 FROM projects WHERE id=?", (pid,)).fetchone() is not None
+    conn.close()
+    return ok
+
+
 def set_active_project(pid):
+    """Chi set active neu project ton tai. Tra True/False."""
+    if not project_exists(pid):
+        return False
     set_meta("active_project_id", str(pid))
+    return True
 
 
 def get_active_project():
@@ -166,14 +194,21 @@ def touch_project(pid):
 
 
 def delete_project(pid):
-    """Xoa 1 project + toan bo du lieu cua no (KHONG dung den project khac)."""
+    """Xoa 1 project + toan bo du lieu cua no (KHONG dung den project khac).
+    Neu xoa project active -> tu chon project con lai (neu co)."""
     conn = _conn()
+    was_active = (_active_pid(conn) == pid)
     for t in ("files", "symbols", "edges", "routes"):
         conn.execute(f"DELETE FROM {t} WHERE project_id=?", (pid,))
     conn.execute("DELETE FROM projects WHERE id=?", (pid,))
     conn.execute("DELETE FROM meta WHERE key=?", (f"overview:{pid}",))
-    if _active_pid(conn) == pid:
-        conn.execute("DELETE FROM meta WHERE key='active_project_id'")
+    if was_active:
+        nxt = conn.execute("SELECT id FROM projects ORDER BY id LIMIT 1").fetchone()
+        if nxt:
+            conn.execute("INSERT INTO meta(key,value) VALUES('active_project_id',?) "
+                         "ON CONFLICT(key) DO UPDATE SET value=?", (str(nxt["id"]), str(nxt["id"])))
+        else:
+            conn.execute("DELETE FROM meta WHERE key='active_project_id'")
     conn.commit()
     conn.close()
 
@@ -191,13 +226,14 @@ def get_indexed_hashes(project_id) -> dict:
 def upsert_file(path, lang, file_hash, skeleton, symbols, edges=None, routes=None, project_id=None):
     conn = _conn()
     now = datetime.now().isoformat()
+    # Identity = (project_id, path) -> project long nhau khong ghi de nhau
     conn.execute(
-        "INSERT INTO files(path, project_id, lang, hash, skeleton, indexed_at, summary) "
+        "INSERT INTO files(project_id, path, lang, hash, skeleton, indexed_at, summary) "
         "VALUES (?,?,?,?,?,?,'') "
-        "ON CONFLICT(path) DO UPDATE SET project_id=?, lang=?, hash=?, skeleton=?, indexed_at=?, summary=''",
-        (path, project_id, lang, file_hash, skeleton, now, project_id, lang, file_hash, skeleton, now),
+        "ON CONFLICT(project_id, path) DO UPDATE SET lang=?, hash=?, skeleton=?, indexed_at=?, summary=''",
+        (project_id, path, lang, file_hash, skeleton, now, lang, file_hash, skeleton, now),
     )
-    conn.execute("DELETE FROM symbols WHERE file_path=?", (path,))
+    conn.execute("DELETE FROM symbols WHERE project_id=? AND file_path=?", (project_id, path))
     conn.executemany(
         "INSERT INTO symbols(project_id, file_path, kind, name, signature, start_line, end_line, parent, exported, tag, doc, body) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -205,25 +241,40 @@ def upsert_file(path, lang, file_hash, skeleton, symbols, edges=None, routes=Non
           s.get("parent"), 1 if s.get("exported") else 0, s.get("tag", ""), s.get("doc", ""), s.get("body", ""))
          for s in symbols],
     )
-    conn.execute("DELETE FROM edges WHERE file_path=?", (path,))
+    conn.execute("DELETE FROM edges WHERE project_id=? AND file_path=?", (project_id, path))
     if edges:
         conn.executemany("INSERT INTO edges(project_id, file_path, caller, callee) VALUES (?,?,?,?)",
                          [(project_id, path, e["caller"], e["callee"]) for e in edges])
-    conn.execute("DELETE FROM routes WHERE file_path=?", (path,))
+    conn.execute("DELETE FROM routes WHERE project_id=? AND file_path=?", (project_id, path))
     if routes:
         conn.executemany("INSERT INTO routes(project_id, file_path, method, path, handler, line) VALUES (?,?,?,?,?,?)",
                          [(project_id, path, r["method"], r["path"], r.get("handler", ""), r.get("line")) for r in routes])
+    # File doi -> overview cua project thanh stale
+    conn.execute("DELETE FROM meta WHERE key=?", (f"overview:{project_id}",))
     conn.commit()
     conn.close()
 
 
-def delete_file(path):
+def delete_file(path, project_id=None):
     conn = _conn()
+    pid = project_id if project_id is not None else _active_pid(conn)
     for t in ("symbols", "edges", "routes"):
-        conn.execute(f"DELETE FROM {t} WHERE file_path=?", (path,))
-    conn.execute("DELETE FROM files WHERE path=?", (path,))
+        conn.execute(f"DELETE FROM {t} WHERE project_id=? AND file_path=?", (pid, path))
+    conn.execute("DELETE FROM files WHERE project_id=? AND path=?", (pid, path))
+    if pid is not None:
+        conn.execute("DELETE FROM meta WHERE key=?", (f"overview:{pid}",))  # invalidate overview
     conn.commit()
     conn.close()
+
+
+def get_symbols_for_file(path, project_id=None):
+    conn = _conn()
+    pid = project_id if project_id is not None else _active_pid(conn)
+    rows = conn.execute(
+        "SELECT * FROM symbols WHERE project_id=? AND file_path=? ORDER BY start_line",
+        (pid, path)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 
 def search_symbols(keyword, limit=20, project_id=None):
@@ -248,10 +299,11 @@ def get_symbols_by_name(name, limit=10, project_id=None):
     return [dict(r) for r in rows]
 
 
-def get_symbol_in_file(name, file_path):
+def get_symbol_in_file(name, file_path, project_id=None):
     conn = _conn()
-    row = conn.execute("SELECT * FROM symbols WHERE name=? AND file_path=? LIMIT 1",
-                       (name, file_path)).fetchone()
+    pid = project_id if project_id is not None else _active_pid(conn)
+    row = conn.execute("SELECT * FROM symbols WHERE project_id=? AND name=? AND file_path=? LIMIT 1",
+                       (pid, name, file_path)).fetchone()
     conn.close()
     return dict(row) if row else None
 
@@ -265,16 +317,18 @@ def symbol_exists(name, project_id=None):
     return row is not None
 
 
-def get_skeleton(path):
+def get_skeleton(path, project_id=None):
     conn = _conn()
-    row = conn.execute("SELECT skeleton FROM files WHERE path=?", (path,)).fetchone()
+    pid = project_id if project_id is not None else _active_pid(conn)
+    row = conn.execute("SELECT skeleton FROM files WHERE project_id=? AND path=?", (pid, path)).fetchone()
     conn.close()
     return row["skeleton"] if row else None
 
 
-def get_file_row(path):
+def get_file_row(path, project_id=None):
     conn = _conn()
-    row = conn.execute("SELECT * FROM files WHERE path=?", (path,)).fetchone()
+    pid = project_id if project_id is not None else _active_pid(conn)
+    row = conn.execute("SELECT * FROM files WHERE project_id=? AND path=?", (pid, path)).fetchone()
     conn.close()
     return dict(row) if row else None
 
@@ -374,9 +428,10 @@ def get_overview(project_id=None):
 
 
 # ---- Tom tat (scope project) ----
-def set_file_summary(path, summary):
+def set_file_summary(path, summary, project_id=None):
     conn = _conn()
-    conn.execute("UPDATE files SET summary=? WHERE path=?", (summary, path))
+    pid = project_id if project_id is not None else _active_pid(conn)
+    conn.execute("UPDATE files SET summary=? WHERE project_id=? AND path=?", (summary, pid, path))
     conn.commit()
     conn.close()
 
@@ -391,9 +446,10 @@ def files_needing_summary(project_id=None):
     return [dict(r) for r in rows]
 
 
-def get_file_summary(path):
+def get_file_summary(path, project_id=None):
     conn = _conn()
-    row = conn.execute("SELECT summary FROM files WHERE path=?", (path,)).fetchone()
+    pid = project_id if project_id is not None else _active_pid(conn)
+    row = conn.execute("SELECT summary FROM files WHERE project_id=? AND path=?", (pid, path)).fetchone()
     conn.close()
     return (row["summary"] if row else "") or ""
 

@@ -41,6 +41,19 @@ def status():
     return s
 
 
+@app.get("/api/health")
+def health():
+    """Trang thai he thong (khong ep load embedding)."""
+    db.init_db()
+    p = db.get_active_project()
+    return {
+        "db": True,
+        "vector": vectors.health(),         # chroma ok? embedding failed? reason
+        "active_project": p["name"] if p else None,
+        "watcher": watcher.observer is not None,
+    }
+
+
 @app.get("/api/models")
 def models():
     """Doc model that tu Ollama (/api/tags) - khong hard-code."""
@@ -62,28 +75,38 @@ def projects():
 @app.post("/api/project/select")
 def project_select(body: ProjectBody):
     """Doi project active: KHONG wipe; reset chat; chuyen watcher sang project moi."""
-    db.set_active_project(body.id)
+    watcher.stop()                          # dung watcher cu truoc khi doi active (chong race)
+    if not db.set_active_project(body.id):
+        return JSONResponse({"error": "Project khong ton tai"}, status_code=404)
     session.history.clear()                 # khong mang history sang project khac
     p = db.get_active_project()
-    watcher.stop()
     if p and os.path.isdir(p["root"]):
         try:
             watcher.start(p["root"])
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[warn] watcher: {e}")
     return {"ok": True, "active": p}
 
 
 @app.post("/api/project/delete")
 def project_delete(body: ProjectBody):
     """Xoa 1 project (SQLite + vector) - KHONG dung den project khac."""
+    if not db.project_exists(body.id):
+        return JSONResponse({"error": "Project khong ton tai"}, status_code=404)
     active = db.active_project_id()
-    db.delete_project(body.id)
-    vectors.delete_project(body.id)
     if active == body.id:
         watcher.stop()
         session.history.clear()
-    return {"ok": True}
+    db.delete_project(body.id)              # tu chon active ke tiep neu xoa active
+    vectors.delete_project(body.id)
+    # Neu con project active moi -> bat lai watcher
+    p = db.get_active_project()
+    if p and os.path.isdir(p["root"]):
+        try:
+            watcher.start(p["root"])
+        except Exception:
+            pass
+    return {"ok": True, "active": p}
 
 
 @app.post("/api/summarize")
@@ -100,7 +123,7 @@ def summarize_status():
 
 @app.get("/api/overview")
 def overview():
-    return {"overview": db.get_meta("overview") or ""}
+    return {"overview": db.get_overview()}   # per-project (overview:{pid})
 
 
 @app.post("/api/index")
@@ -108,8 +131,12 @@ def do_index(body: IndexBody):
     import os
     if not os.path.isdir(body.path):
         return JSONResponse({"error": f"Khong tim thay thu muc: {body.path}"}, status_code=400)
+    watcher.stop()                        # dung watcher project cu truoc khi doi active (chong race)
     stats = index_project(body.path)
-    watcher.start(stats["project_root"])  # tu dong theo doi project nay
+    try:
+        watcher.start(stats["project_root"])
+    except Exception as e:
+        print(f"[warn] watcher: {e}")
     return stats
 
 
@@ -141,10 +168,13 @@ def symbol(name: str):
 
 @app.get("/api/file")
 def file(path: str):
-    return {
-        "file": db.get_file_row(path),
-        "symbols": db.get_symbols_for_files([path]),
-    }
+    row = db.get_file_row(path)
+    # Khong cho doc file thuoc project khac (chong leak)
+    if row and row.get("project_id") != db.active_project_id():
+        return JSONResponse({"error": "File khong thuoc project active"}, status_code=404)
+    if not row:
+        return JSONResponse({"error": "File khong ton tai trong index"}, status_code=404)
+    return {"file": row, "symbols": db.get_symbols_for_file(path)}
 
 
 @app.post("/api/chat")

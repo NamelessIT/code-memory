@@ -4,7 +4,7 @@ App local quét codebase → lưu cấu trúc (hàm, class, import, skeleton...)
 
 - Giao diện: **Web UI local** (trình duyệt)
 - Chế độ: **read-only** (giải thích, không sửa file)
-- Ngôn ngữ index: **JavaScript / TypeScript / TSX / C#**
+- Ngôn ngữ index: **Python / JavaScript / TypeScript / TSX / C#**
 
 ## Cài đặt
 
@@ -70,7 +70,8 @@ web/           giao diện chat
 - **Route API**: tự trích endpoint Express / ASP.NET (nút **Routes**, API `/api/routes`)
 - **Tag** FE / BE / event cho symbol
 - **Auto re-index**: theo dõi file project, đổi là cập nhật (watchdog)
-- **Xoá index** + tự dọn khi đổi project (tránh phình DB)
+- **Xoá index** thủ công (đổi project KHÔNG xoá project khác — mỗi project giữ riêng)
+- **Degraded mode**: vector/embedding lỗi → vẫn chạy lexical-only (`/api/health` báo trạng thái)
 - **Tóm tắt AI** (nút **Tóm tắt**): LLM tóm tắt "tác dụng" từng file + dựng **bản đồ tổng quan** dự án (nút **Tổng quan**), nạp vào ngữ cảnh để trả lời sâu hơn
 - **1-click + icon**: shortcut Desktop (`install_shortcut.ps1`)
 

@@ -58,7 +58,7 @@ def index_project(root: str, progress=None):
     # File da bi xoa khoi disk -> go khoi index (trong project nay)
     removed = [p for p in existing if p not in seen]
     for p in removed:
-        db.delete_file(p)
+        db.delete_file(p, project_id=pid)
         vectors.delete_file(p)
 
     db.touch_project(pid)

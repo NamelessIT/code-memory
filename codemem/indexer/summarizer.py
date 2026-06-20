@@ -51,15 +51,15 @@ def summarize_file(skeleton: str):
     return _ask(_FILE_SYS, f"Cấu trúc file:\n{(skeleton or '')[:3500]}")
 
 
-def build_overview():
-    sums = db.all_file_summaries(limit=400)
+def build_overview(project_id=None):
+    sums = db.all_file_summaries(limit=400, project_id=project_id)
     if not sums:
         return ""
     import os
     body = "\n".join(f"- {os.path.basename(s['path'])}: {s['summary']}" for s in sums)[:8000]
     ov = _ask(_OVERVIEW_SYS, f"Tóm tắt các file:\n{body}", max_ctx=NUM_CTX)
     if ov:
-        db.set_overview(ov)
+        db.set_overview(ov, project_id=project_id)
     return ov or ""
 
 
@@ -70,20 +70,21 @@ def run_summarize(make_overview=True):
             return
         progress = {"running": True, "done": 0, "total": 0, "errors": 0, "phase": "summarizing"}
     try:
-        pid = db.active_project_id()
-        files = db.files_needing_summary()
+        pid = db.active_project_id()       # bind cung pid tu dau -> switch UI khong doi target
+        progress["project_id"] = pid
+        files = db.files_needing_summary(project_id=pid)
         progress["total"] = len(files)
         for f in files:
             summ = summarize_file(f["skeleton"] or "")
             if summ:                       # chi luu summary hop le
-                db.set_file_summary(f["path"], summ)
+                db.set_file_summary(f["path"], summ, project_id=pid)
                 vectors.index_summary(f["path"], f["lang"], summ, project_id=pid)
             else:
                 progress["errors"] += 1
             progress["done"] += 1
         if make_overview:
             progress["phase"] = "overview"
-            build_overview()
+            build_overview(project_id=pid)
     finally:
         progress["phase"] = "done"
         progress["running"] = False

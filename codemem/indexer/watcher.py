@@ -17,18 +17,31 @@ except ImportError:
 
 def _ignored(path: str) -> bool:
     parts = Path(path).parts
-    return any(p in IGNORE_DIRS for p in parts)
+    return any(p.lower() in IGNORE_DIRS for p in parts)   # khong phan biet hoa/thuong
+
+
+def _relevant(path):
+    return (not _ignored(path)) and detect_lang(Path(path)) is not None
 
 
 class _Handler(FileSystemEventHandler):
     def __init__(self, manager):
         self.m = manager
 
-    def on_any_event(self, event):
+    def on_moved(self, event):
+        # File doi cho: go src cu, index dest moi
         if event.is_directory:
             return
+        if _relevant(event.src_path):
+            self.m.schedule(event.src_path, deleted=True)
+        if _relevant(event.dest_path):
+            self.m.schedule(event.dest_path, deleted=False)
+
+    def on_any_event(self, event):
+        if event.is_directory or event.event_type == "moved":
+            return
         path = event.src_path
-        if _ignored(path) or detect_lang(Path(path)) is None:
+        if not _relevant(path):
             return
         self.m.schedule(path, deleted=(event.event_type == "deleted"))
 
@@ -54,6 +67,12 @@ class WatcherManager:
         return True
 
     def stop(self):
+        # Huy timer + clear pending de event project cu khong flush sau khi switch
+        with self._lock:
+            if self._timer:
+                self._timer.cancel()
+                self._timer = None
+            self._pending.clear()
         if self.observer:
             try:
                 self.observer.stop()
@@ -61,6 +80,7 @@ class WatcherManager:
             except Exception:
                 pass
             self.observer = None
+        self.root = None
 
     def schedule(self, path, deleted=False):
         with self._lock:
