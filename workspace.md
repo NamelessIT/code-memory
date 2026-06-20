@@ -236,5 +236,37 @@ Lệnh kiểm tra tối thiểu:
 ## CLAUDE_REPORT — temporary handoff
 
 <!-- CLAUDE_REPORT_START -->
-Claude Code: thay nội dung này bằng báo cáo triển khai mới sau khi hoàn thành task.
+## Vòng — P0-10 durable cleanup-intent (kèm P0-8 cleanup-durable, P0-6 clear-in-lock)
+
+**Commit:** work `5feef23` (report commit ngay sau). **Working tree:** clean sau report.
+**Env:** Python 3.12.13 (venv Ollama), chromadb 1.5.9, watchdog 6.0.0.
+
+### Task đã xử lý
+- **P0-10 (cleanup-intent đáng tin):**
+  - Schema `vector_tombstones` v2: `scope (file|project|collection)` + `attempts` + `last_error` + `next_retry` + `UNIQUE(scope,project_id,file_path)`; migration tự recreate bảng cũ (round trước thiếu cột).
+  - `add_tombstone` dùng `INSERT OR IGNORE` → **dedup** (Codex repro duplicate hết). `due_tombstones` **ORDER BY next_retry, id** → chống starvation (>500/poison: item fail bị đẩy next_retry tương lai, item khác được xử lý). `record_tombstone_failure` **exponential backoff** (5s→cap 1h) + lưu `attempts`/`last_error`.
+  - `db.clear_all()` **wipe `vector_tombstones`** (Codex repro 1→0); `delete_project` collapse file-tombstone của project.
+  - `/api/clear`: nếu `vectors.clear_all()` fail → tạo **collection tombstone** (retry sau), trả `pending_cleanup`; `watcher.stop()` chuyển **vào trong INDEX_LOCK** (#P0-6 — index đang chờ không start lại watcher trước clear).
+  - `_retry_tombstones` xử lý cả 3 scope (collection→clear_all, project→delete_project, file→delete_file) + backoff khi fail; chạy trong `reconcile_vectors` (index/switch/manual/startup).
+  - `/api/health` surface `cleanup: {pending, failed, last_error}`.
+- **P0-8 (migration cleanup durable):** `_migrate_canonical_roots` **không gọi Chroma trong transaction** nữa — ghi cleanup intent bằng `add_tombstones_bulk(conn, ...)` trong **cùng transaction** SQLite (durable), worker retry idempotent sau.
+
+### File/API đã đổi
+- `codemem/storage/db.py`: schema v2 + recreate migration; `add_tombstone`/`add_tombstones_bulk`/`due_tombstones`/`record_tombstone_failure`/`del_tombstone`/`tombstone_stats`; `clear_all`+`delete_project` wipe/collapse; migration dùng bulk tombstone.
+- `codemem/indexer/runner.py`: `_retry_tombstones` v2 (scope + backoff); callers `add_tombstone(scope,...)`.
+- `codemem/api/server.py`: `/api/clear` stop-in-lock + collection tombstone + `pending_cleanup`; delete tombstone signature; health `cleanup` stats.
+
+### Test + kết quả
+- `python -m pytest tests -q` → **45 passed** (mới `test_tombstones.py`: dedup, clear-wipe 1→0, backoff-fairness loại item fail khỏi due, project collapse, attempts/last_error; cập nhật retry scopes + backoff).
+- `compileall` pass; `node --check web/app.js` pass; server import **25 routes**.
+- Real DB: migration recreate `vector_tombstones` đủ cột; DB intact 27 file/pending 0; cleanup stats sạch.
+
+### Partial / chưa làm
+- **P0-10**: chưa có **endpoint/job retry tombstone độc lập** (mới chạy ghép trong reconcile) + chưa surface trong **UI**; backoff dùng wall-clock `next_retry` (không có jitter). `/api/clear` khi DB clear xong nhưng vector fail: collection tombstone tạo sau `clear_all` (đã wipe) nên không bị xoá nhầm — OK, nhưng nếu `add_tombstone` lỗi giữa chừng thì mất intent (không bọc cùng transaction với clear).
+- **P0-8**: migration vẫn dùng marker boolean `roots_canon_v2` (chưa phải migration-version số + backup/rollback chính thức); chưa test junction thật (chỉ casing/separator); cleanup intent giờ durable nhưng chưa test "process interruption giữa transform và retry".
+- **P0-6**: generation guard vẫn **không hủy callback đang ghi dở**; **summarizer vẫn ngoài INDEX_LOCK**; chưa có **deterministic API-concurrency test** (mới unit/DB-level). → gắn **P1-16**.
+- **P0-5**: inventory/content-hash đối chiếu vector thật + summary-embedding version vẫn chưa làm.
+
+### Regression
+- Không. 45/45 pass gồm toàn bộ test cũ; health chroma true; DB thật nguyên vẹn.
 <!-- CLAUDE_REPORT_END -->
