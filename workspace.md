@@ -233,5 +233,37 @@ Lệnh kiểm tra tối thiểu:
 ## CLAUDE_REPORT — temporary handoff
 
 <!-- CLAUDE_REPORT_START -->
-Claude Code: thay placeholder này bằng báo cáo của vòng triển khai mới. Không xóa marker.
+## Vòng triển khai — P0-5, P0-6, P0-8, P0-10 (reliability + project-scoped lifecycle)
+
+**Commit:** work ở `9af630e` (report commit ngay sau). **Working tree:** clean sau report commit.
+**Môi trường:** Python 3.12.13 (venv Ollama), chromadb 1.5.9, tree-sitter-language-pack, watchdog 6.0.0.
+
+### Task đã xử lý
+- **P0-8 (vector leak nested):** `vectors.delete_file(path, project_id)` chỉ xoá trong project (`where {$and:[file_path, project_id]}`); `index_file` gọi delete kèm `project_id`; vector IDs đã có prefix `project_id`; canonicalize root (`os.path.normcase/normpath/realpath`) + normcase file path trong runner → cùng thư mục không tạo project trùng.
+- **P0-5 (vector reconciliation):** thêm cột `files.vector_ok`; runner set sau `index_file`; `reconcile_vectors(pid)` retry file pending (kể cả file unchanged từng lỗi vector); `get_status().vector_pending` + `index_project` trả `vector_repaired/vector_pending`.
+- **P0-6 (watcher bind project):** `WatcherManager` giữ `project_id` + `generation`; `_flush(gen)` bỏ qua khi generation stale (sau switch/stop) → không ghi vào project mới; `index_single_file/remove_file(path, project_id)` bind cứng pid (không đọc active toàn cục); `watcher.start(root, project_id)` ở index/select/delete/startup.
+- **P0-10 (partial-result):** `vectors.clear_all/delete_file/delete_project` trả bool; `/api/clear` stop watcher + reset chat session + trả `{sqlite_cleared, vector_cleared}`; `/api/project/delete` trả `vector_deleted`.
+
+### File/schema/API đã đổi
+- `codemem/storage/db.py`: cột `files.vector_ok` (+migration, +files_new recreate); `set_vector_ok/files_pending_vector/get_project_root`; `delete_file(path, project_id)`; `get_status.vector_pending`.
+- `codemem/storage/vectors.py`: `delete_file(path, project_id)` + return bool; `index_file` delete scoped; `clear_all/delete_project` return bool.
+- `codemem/indexer/runner.py`: `canonical_root`, `_index_one` (set vector_ok), `reconcile_vectors`, `index_single_file/remove_file` nhận `project_id`, normcase paths.
+- `codemem/indexer/watcher.py`: bind `project_id`+`generation`, `_flush(gen)` guard, truyền pid.
+- `codemem/api/server.py`: `watcher.start(..., project_id)` ở 4 chỗ; `/api/clear` + `/api/project/delete` partial-result + reset session.
+
+### Lệnh test + kết quả
+- `python -m pytest tests -q` → **31 passed** (mới: `test_watcher.py` 3, `test_reconcile.py` 2, vector delete-scoping 2 trong `test_vectors_degraded.py`).
+- `python -m compileall -q codemem` → pass. `node --check web/app.js` → pass. Server import: **24 routes**.
+
+### Integration evidence
+- Nested: index A=`outer/sub`, B=`outer` (gồm `sub/x.py`). Reindex A sau khi sửa file → **B vẫn thấy symbol** (vector B không bị xoá). `vector_pending=0` sau index repo (27 file).
+- `/api/project/select {id:999999}` → **404** (đã verify vòng trước, không regression).
+
+### Partial / chưa làm
+- P0-6 "serialize hai request index đồng thời": chưa có lock toàn cục cho index/watch/delete chạy song song — generation guard chỉ chống stale flush, chưa chống 2 `/api/index` đồng thời (cần global index lock — gắn với P1-16 background jobs). Concurrency test deterministic mới có cho watcher flush, chưa có cho 2 index job song song.
+- P0-5: chưa có outbox bền vững qua restart; reconcile chạy cuối mỗi `index_project` + có thể gọi thủ công, nhưng chưa có endpoint `/api/reconcile` riêng và chưa surface ra UI.
+- P0-10: chưa rebind chat session theo project sau partial-failure (mới reset); chưa có retry UI.
+
+### Regression/phát hiện mới
+- (Tự phát hiện & đã fix trong vòng này) `clear_all`/`_raw` bản trước tạo collection KHÔNG embedding-function → ghi đè ef config thành "default" → `get_collection` (sentence_transformer) xung đột → degraded oan. Đã sửa: `_raw` dùng `get_collection` (retrieve, không cấp ef); `clear_all` chỉ `delete_collection` rồi reset, để lần sau tạo lại đúng ef. Verify: health `chroma:true, embedding_failed:false`, semantic OK.
 <!-- CLAUDE_REPORT_END -->
