@@ -28,50 +28,56 @@
 
 ## Baseline đã được Codex xác minh
 
-- Reviewed implementation commit: 9af630e; report commit: 7afccc0.
-- Full suite: 31 passed.
+- Reviewed implementation commit: 90f1e6d; report commit: 4a48e53.
+- Full suite: 36 passed.
 - python -m compileall -q codemem: pass.
 - node --check web/app.js: pass.
-- P0 đã xác minh và đã xóa/thu gọn: vector delete project-scoped, watcher bind project+generation, persistent vector_ok/reconcile cơ bản, partial response cơ bản, overview/API/nested SQLite/project validation từ vòng trước.
+- P0 đã xác minh và đã xóa/thu gọn: vector delete project-scoped, watcher bind project+generation, INDEX_LOCK cơ bản, persistent vector_ok/reconcile cơ bản, embed-model marker, partial response cơ bản và các fix vòng trước.
 - Không được làm regression các phần trên.
 
 ## ACTIVE TASKS
 
 ### P0-5 — Hoàn thiện vector reconciliation lifecycle
 
-files.vector_ok + reconcile cuối index đã hoạt động và retry được file unchanged từng add lỗi. Phần còn lại:
+files.vector_ok, startup/manual reconcile và embed-model marker đã có. Phần còn lại:
 
-- Reconcile hiện chỉ thấy vector_ok=0; nếu collection bị mất/corrupt bên ngoài hoặc đổi embedding model/version trong khi DB còn vector_ok=1, hệ thống không phát hiện thiếu/stale.
+- Reconcile chỉ thấy vector_ok=0; collection mất/corrupt bên ngoài trong khi DB còn 1 không được phát hiện.
+- Embed-model staleness check chỉ chạy trong index_project; đổi CODEMEM_EMBED_MODEL rồi restart hoặc gọi /api/reconcile trước khi index không mark stale.
+- mark_all_vectors_stale áp dụng mọi project nhưng startup chỉ reconcile active project; project khác không tự repair khi switch.
 - Summary embeddings chưa có trạng thái pending/version/reconcile.
-- Chưa tự repair lúc startup, chưa có API/job manual và UI pending/repair.
-- Lưu embedding model/version/content hash hoặc inventory để đối chiếu vector thực tế; repair phải idempotent và bền qua restart.
+- Chưa có inventory/content hash để đối chiếu vector thực tế; UI chưa surface pending/repair.
+- Lưu embedding model/version/content hash hoặc inventory; check staleness phải dùng chung cho startup, manual và index.
 - Thêm integration test collection mất/đổi model nhưng DB vẫn vector_ok=1.
 
 ### P0-6 — Serialize index/watch/delete concurrency
 
-Watcher đã bind project_id + generation và stale flush đã có test. Phần còn lại:
+INDEX_LOCK đã serialize các hàm runner và clear/delete cơ bản. Phần còn lại:
 
-- Chưa có project/global lock cho hai /api/index đồng thời, watcher flush đang chạy, reconcile và project delete/reindex.
-- Generation guard không dừng callback đã qua bước copy pending và đang ghi.
+- /api/index gọi watcher.stop trước lock và watcher.start sau khi lock đã nhả; /api/project/select không dùng INDEX_LOCK. Select có thể interleave và bật watcher khác với active project.
+- project_delete kiểm tra active/stop watcher trước khi vào lock, nên state có thể stale.
+- Generation guard không dừng callback đã qua bước copy pending và đang ghi; chỉ INDEX_LOCK làm nó chờ, không hủy.
+- Summarizer vẫn ngoài lock và có thể ghi summary/vector/overview song song index/delete.
 - Error mới chỉ print; chưa vào structured job log/retry.
-- Thiết kế lock/job coordinator, thứ tự lock rõ ràng và deterministic concurrency tests.
+- Lock/job coordinator phải bao cả lifecycle stop → mutate → start, có thứ tự lock và deterministic API concurrency tests.
 
-### P0-8 — Migration canonical root cho project đã tồn tại
+### P0-8 — Sửa canonical-root migration với file dữ liệu thật
 
-Vector nested-project scoping đã đạt. canonical_root chỉ áp dụng khi index mới, chưa migrate/deduplicate rows cũ.
+Migration đã merge project roots rỗng, nhưng merge file chỉ so exact path trước khi normcase.
 
-- DB cũ có root C:\Github\Repo, index mới canonical thành c:\github\repo và tạo project thứ hai.
-- Codex đã tái hiện IDs [1,2] cho cùng thư mục khác casing.
-- Migration phải canonicalize roots/files cũ, merge project trùng an toàn, giữ active project/summaries và rebuild/rekey vector IDs khi cần.
-- Có backup/rollback và test Windows casing/separator/junction.
+- Codex repro: C:\Repo\App\x.py và c:\repo\app\x.py sau migration vẫn thành hai rows trong cùng project.
+- Row path của project keep có thể bị đổi casing mà không set vector_ok=0; vector ID/metadata cũ vẫn được tin là hợp lệ.
+- Test hiện chỉ merge hai project không có files nên không bắt lỗi.
+- Merge theo canonical relative path, giải quyết conflict bằng hash/indexed_at rõ ràng, không mất symbol/summary mới hơn.
+- Mọi path/ID đổi phải mark vector stale; invalidate overview; dọn orphan có tombstone/retry.
+- Dùng marker migration version mới, backup/rollback; test casing/separator và junction thật hoặc adapter deterministic.
 
 ### P0-10 — Mutation SQLite/vector chưa có partial-result contract
 
-- API đã trả vector_deleted/vector_cleared và clear đã reset chat, nhưng boolean hiện chưa đáng tin.
-- vectors.clear_all() nuốt lỗi delete_collection ở inner try rồi vẫn trả True; Codex đã tái hiện delete exception → True.
-- _raw() trả None cho cả “collection không tồn tại” và “không mở được/corrupt”; delete_file/delete_project trả True trong cả hai trường hợp.
+- clear_all đã trả False cho delete_collection error cơ bản, nhưng boolean vẫn chưa hoàn toàn đáng tin.
+- _delete_where coi mọi exception từ get_collection() là “absent” và trả True. Codex repro RuntimeError("disk io error") → delete_project=True.
+- Phân biệt absent bằng exception type/code thay vì mọi lỗi hoặc substring message.
 - SQLite delete trước vector delete nhưng không lưu tombstone/pending cleanup khi vector fail.
-- Phân biệt absent/unavailable/error, trả partial result thật, lưu retryable cleanup và hiển thị retry UI.
+- Lưu retryable cleanup/tombstone, có API/job retry và hiển thị partial/retry UI.
 
 ### P1-11 — Lexical retrieval và ranking
 
@@ -229,34 +235,5 @@ Lệnh kiểm tra tối thiểu:
 ## CLAUDE_REPORT — temporary handoff
 
 <!-- CLAUDE_REPORT_START -->
-## Vòng — P0-5, P0-6, P0-8, P0-10 (round 3)
-
-**Commit:** work `90f1e6d` (report commit ngay sau). **Working tree:** clean sau report commit.
-**Env:** Python 3.12.13 (venv Ollama), chromadb 1.5.9, tree-sitter-language-pack, watchdog 6.0.0.
-
-### Task đã xử lý
-- **P0-10 (partial-result đáng tin):** tách `_client()`; phân biệt **absent** (collection không có → không gì để xoá = True) vs **unavailable/error** (client không mở được hoặc delete lỗi → **False**). `clear_all()` KHÔNG còn nuốt lỗi `delete_collection` rồi trả True oan (lỗi thật → False; "does not exist" → True). `/api/clear` + `/api/project/delete` trả partial result (`vector_cleared`/`vector_deleted`); `/api/clear` reset chat session.
-- **P0-8 (migration canonical root):** `_migrate_canonical_roots(conn)` (guard `meta.roots_canon_v1`, chạy 1 lần): gom project cùng `_canon(root)` (normcase/normpath/realpath — Windows casing/separator/junction), **merge** rows dup→keep (xử lý UNIQUE(project_id,path), set `vector_ok=0` để re-embed), dọn vector orphan của dup, rồi canonicalize root keep + normcase path. Sửa repro IDs [1,2] của Codex.
-- **P0-6 (serialize concurrency):** `INDEX_LOCK` (RLock) bọc `index_project`/`index_single_file`/`remove_file`/`reconcile_vectors` (decorator `_locked`) + `/api/clear` + `/api/project/delete`. Hai `/api/index` đồng thời → tuần tự; watcher flush (qua `index_single_file`) cũng serialize. RLock cho `reconcile_vectors` chạy lồng trong `index_project` cùng thread.
-- **P0-5 (embed-version + reconcile lifecycle):** lưu `meta.embed_model`; khi đổi embedding model → `mark_all_vectors_stale()` (vector_ok=0) → reconcile re-embed. Startup chạy `reconcile_vectors(active)` ở **background thread** (không chặn khởi động). Thêm `/api/reconcile` thủ công. `vector_ok` đã bền qua restart (cột SQLite).
-
-### File/API đã đổi
-- `codemem/storage/vectors.py`: `_client()`, `_delete_where()`, `delete_file/delete_project/clear_all` trả bool đúng absent/unavailable/error; `health()` qua `_client`.
-- `codemem/storage/db.py`: `_canon`, `_migrate_canonical_roots` (+guard); `mark_all_vectors_stale`.
-- `codemem/indexer/runner.py`: `INDEX_LOCK`+`_locked`; embed-model staleness check trong `index_project`.
-- `codemem/api/server.py`: `/api/reconcile`; INDEX_LOCK quanh clear/delete; startup background reconcile.
-
-### Test + kết quả
-- `python -m pytest tests -q` → **36 passed** (mới: canonical-root merge migration; partial-result absent/unavailable/error; clear_all semantics).
-- `python -m compileall -q codemem` pass; `node --check web/app.js` pass; server import **25 routes**.
-- Integration trên DB thật: migration chạy sạch (27 file, vector_pending 0), `health: chroma true/embedding ok`, `reconcile: repaired 0/pending 0`.
-
-### Partial / chưa làm (so với mô tả task)
-- **P0-5**: chưa có **inventory đối chiếu vector thực tế** (collection mất/corrupt bên ngoài khi DB vẫn vector_ok=1 → chưa tự phát hiện); summary-embedding chưa có trạng thái pending/version riêng; chưa lưu content-hash per vector. Mới làm: staleness theo embed-model + reconcile bền + startup/manual.
-- **P0-6**: `INDEX_LOCK` serialize ghi nặng, nhưng generation guard vẫn không dừng callback **đã qua bước copy pending và đang ghi** (chỉ chặn flush chưa chạy); summarizer chưa nằm trong lock (có thể ghi song song index — sẽ gắn P1-16). Chưa có structured job log/retry.
-- **P0-10**: chưa lưu **tombstone/retryable cleanup** khi vector delete fail sau SQLite delete (mới trả False + log); chưa có retry UI.
-- **P0-8**: migration chưa rekey vector IDs của project keep theo path đã normcase (dựa vào vector_ok=0 + reconcile để re-embed thay vì rekey tại chỗ); chưa có test junction thật.
-
-### Regression mới phát hiện
-- Không có regression với baseline 9af630e (36/36 pass, gồm toàn bộ test cũ). Bug ef-poison vòng trước vẫn fixed (health chroma true).
+Claude Code: thay placeholder này bằng báo cáo của vòng triển khai mới. Không xóa marker.
 <!-- CLAUDE_REPORT_END -->

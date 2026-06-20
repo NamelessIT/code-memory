@@ -74,17 +74,25 @@ def projects():
 
 @app.post("/api/project/select")
 def project_select(body: ProjectBody):
-    """Doi project active: KHONG wipe; reset chat; chuyen watcher sang project moi."""
-    watcher.stop()                          # dung watcher cu truoc khi doi active (chong race)
-    if not db.set_active_project(body.id):
+    """Doi project active: KHONG wipe; reset chat; chuyen watcher. Toan bo stop->mutate->start
+    trong INDEX_LOCK de khong interleave voi index/flush (#P0-6)."""
+    if not db.project_exists(body.id):
         return JSONResponse({"error": "Project khong ton tai"}, status_code=404)
-    session.history.clear()                 # khong mang history sang project khac
-    p = db.get_active_project()
-    if p and os.path.isdir(p["root"]):
-        try:
-            watcher.start(p["root"], project_id=p["id"])
-        except Exception as e:
-            print(f"[warn] watcher: {e}")
+    with INDEX_LOCK:
+        watcher.stop()
+        db.set_active_project(body.id)
+        session.history.clear()             # khong mang history sang project khac
+        p = db.get_active_project()
+        if p and os.path.isdir(p["root"]):
+            try:
+                watcher.start(p["root"], project_id=p["id"])
+            except Exception as e:
+                print(f"[warn] watcher: {e}")
+    # Repair vector pending cua project moi o nen (#P0-5)
+    if p:
+        import threading
+        from ..indexer.runner import reconcile_vectors
+        threading.Thread(target=lambda: reconcile_vectors(p["id"]), daemon=True).start()
     return {"ok": True, "active": p}
 
 
@@ -93,20 +101,19 @@ def project_delete(body: ProjectBody):
     """Xoa 1 project (SQLite + vector) - KHONG dung den project khac."""
     if not db.project_exists(body.id):
         return JSONResponse({"error": "Project khong ton tai"}, status_code=404)
-    active = db.active_project_id()
-    if active == body.id:
-        watcher.stop()
-        session.history.clear()
-    with INDEX_LOCK:                        # serialize voi index/reconcile (#P0-6)
+    # Toan bo stop->mutate->start trong lock (#P0-6) de state khong stale.
+    with INDEX_LOCK:
+        if db.active_project_id() == body.id:
+            watcher.stop()
+            session.history.clear()
         db.delete_project(body.id)          # tu chon active ke tiep neu xoa active
         vec_ok = vectors.delete_project(body.id)
-    # Neu con project active moi -> bat lai watcher
-    p = db.get_active_project()
-    if p and os.path.isdir(p["root"]):
-        try:
-            watcher.start(p["root"], project_id=p["id"])
-        except Exception:
-            pass
+        p = db.get_active_project()
+        if p and os.path.isdir(p["root"]):
+            try:
+                watcher.start(p["root"], project_id=p["id"])
+            except Exception:
+                pass
     # Partial result: SQLite da xoa; bao ro vector co xoa duoc khong (#P0-10)
     return {"ok": True, "vector_deleted": vec_ok, "active": p}
 
@@ -143,12 +150,14 @@ def do_index(body: IndexBody):
     import os
     if not os.path.isdir(body.path):
         return JSONResponse({"error": f"Khong tim thay thu muc: {body.path}"}, status_code=400)
-    watcher.stop()                        # dung watcher project cu truoc khi doi active (chong race)
-    stats = index_project(body.path)
-    try:
-        watcher.start(stats["project_root"], project_id=stats["project_id"])
-    except Exception as e:
-        print(f"[warn] watcher: {e}")
+    # stop->index->start trong 1 lock (#P0-6): khong interleave voi index/select/delete khac
+    with INDEX_LOCK:
+        watcher.stop()
+        stats = index_project(body.path)
+        try:
+            watcher.start(stats["project_root"], project_id=stats["project_id"])
+        except Exception as e:
+            print(f"[warn] watcher: {e}")
     return stats
 
 

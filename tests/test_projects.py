@@ -84,19 +84,33 @@ def test_delete_active_picks_next(tmp_path, monkeypatch):
 
 
 def test_canonical_root_merge_migration(tmp_path, monkeypatch):
-    # #P0-8: hai project cung canonical root khac casing -> migration merge con 1
+    # #P0-8: hai project cung canonical root khac casing + file cung normcase -> merge con 1 project, 1 file
+    import codemem.storage.vectors as vec
+    monkeypatch.setattr(vec, "delete_project", lambda *a, **k: True)   # tranh cham chroma that
+    monkeypatch.setattr(vec, "delete_file", lambda *a, **k: True)
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "merge.db")
     db.init_db()
     conn = db._conn()
-    conn.execute("INSERT INTO projects(root,name,created_at,last_indexed_at) VALUES (?,?,?,?)",
-                 ("C:\\Repo\\App", "App", "t", "t"))
-    conn.execute("INSERT INTO projects(root,name,created_at,last_indexed_at) VALUES (?,?,?,?)",
-                 ("c:\\repo\\app", "app", "t", "t"))
-    conn.execute("DELETE FROM meta WHERE key='roots_canon_v1'")   # cho migration chay lai
+    conn.execute("INSERT INTO projects(root,name,created_at,last_indexed_at) VALUES ('C:\\Repo\\App','App','t','t')")
+    conn.execute("INSERT INTO projects(root,name,created_at,last_indexed_at) VALUES ('c:\\repo\\app','app','t','t')")
+    p1 = conn.execute("SELECT id FROM projects WHERE root='C:\\Repo\\App'").fetchone()["id"]
+    p2 = conn.execute("SELECT id FROM projects WHERE root='c:\\repo\\app'").fetchone()["id"]
+    conn.execute("INSERT INTO files(project_id,path,lang,hash,skeleton,indexed_at,summary,vector_ok) "
+                 "VALUES (?,?,?,?,?,?,?,1)", (p1, "C:\\Repo\\App\\x.py", "python", "h1", "s1", "2026-01-01", ""))
+    conn.execute("INSERT INTO files(project_id,path,lang,hash,skeleton,indexed_at,summary,vector_ok) "
+                 "VALUES (?,?,?,?,?,?,?,1)", (p2, "c:\\repo\\app\\x.py", "python", "h2", "s2", "2026-02-01", ""))
+    conn.execute("DELETE FROM meta WHERE key='roots_canon_v1'")
     conn.commit()
     conn.close()
+
     db.init_db()                                   # trigger _migrate_canonical_roots
-    assert len(db.list_projects()) == 1
+
+    projs = db.list_projects()
+    assert len(projs) == 1                         # 2 project trung canonical -> 1
+    pid = projs[0]["id"]
+    assert db.get_status(pid)["files"] == 1        # 2 file cung normcase -> 1
+    f = db.get_file_row("c:\\repo\\app\\x.py", project_id=pid)
+    assert f is not None and f["vector_ok"] == 0   # path doi -> mark re-embed
 
 
 def test_indexed_hashes_scoped(tmp_path, monkeypatch):

@@ -137,64 +137,84 @@ def _canon(root):
 
 
 def _migrate_canonical_roots(conn):
-    """Gop project trung canonical-root + canonicalize root/path (#P0-8). Chay 1 lan."""
+    """Gop project trung canonical-root + dedup file theo normcase path (#P0-8). Chay 1 lan.
+    Merge theo (canonical project, normcase path); xung dot -> giu indexed_at moi nhat;
+    moi path/project doi -> vector_ok=0 (re-embed) va don vector cu."""
     import os
     rows = conn.execute("SELECT id, root FROM projects ORDER BY id").fetchall()
     active = _active_pid(conn)
-    orphan_dup_pids = []
+    vec_cleanup = []     # (project_id, path) vector cu can xoa
+    dup_pids = []
 
-    # Gom theo canonical, giu id nho nhat
     groups = {}
     for r in rows:
         groups.setdefault(_canon(r["root"]), []).append(r["id"])
 
+    def _del_file(pidx, path):
+        for t in ("symbols", "edges", "routes"):
+            conn.execute(f"DELETE FROM {t} WHERE project_id=? AND file_path=?", (pidx, path))
+        conn.execute("DELETE FROM files WHERE project_id=? AND path=?", (pidx, path))
+
     for canon, ids in groups.items():
         keep = ids[0]
-        # 1) Merge + xoa cac dup TRUOC (de giai phong root canonical)
+        # Gom tat ca file trong nhom (moi project id)
+        files = []
+        for pidx in ids:
+            for f in conn.execute("SELECT path, indexed_at FROM files WHERE project_id=?", (pidx,)).fetchall():
+                files.append((pidx, f["path"], f["indexed_at"] or ""))
+
+        # Chon survivor cho moi normcase-key (indexed_at moi nhat)
+        best = {}
+        for (pidx, path, ts) in files:
+            nkey = os.path.normcase(path)
+            cur = best.get(nkey)
+            if cur is None or ts >= cur[2]:
+                best[nkey] = (pidx, path, ts)
+        survivors = {(b[0], b[1]) for b in best.values()}
+
+        # Xoa cac ban khong phai survivor
+        for (pidx, path, ts) in files:
+            if (pidx, path) not in survivors:
+                _del_file(pidx, path)
+                vec_cleanup.append((pidx, path))
+
+        # Dua survivor ve (keep, nkey)
+        for nkey, (pidx, path, ts) in best.items():
+            if (pidx, path) == (keep, nkey):
+                continue
+            for t in ("symbols", "edges", "routes"):
+                conn.execute(f"UPDATE {t} SET project_id=?, file_path=? WHERE project_id=? AND file_path=?",
+                             (keep, nkey, pidx, path))
+            conn.execute("UPDATE files SET project_id=?, path=?, vector_ok=0 WHERE project_id=? AND path=?",
+                         (keep, nkey, pidx, path))
+            vec_cleanup.append((pidx, path))      # vector ID cu (pidx, path) khac (keep, nkey)
+
+        # Xoa cac dup project + overview
         for dup in ids[1:]:
-            for f in conn.execute("SELECT path FROM files WHERE project_id=?", (dup,)).fetchall():
-                p = f["path"]
-                if conn.execute("SELECT 1 FROM files WHERE project_id=? AND path=?", (keep, p)).fetchone():
-                    for t in ("symbols", "edges", "routes"):
-                        conn.execute(f"DELETE FROM {t} WHERE project_id=? AND file_path=?", (dup, p))
-                    conn.execute("DELETE FROM files WHERE project_id=? AND path=?", (dup, p))
-                else:
-                    conn.execute("UPDATE files SET project_id=?, vector_ok=0 WHERE project_id=? AND path=?",
-                                 (keep, dup, p))
-                    for t in ("symbols", "edges", "routes"):
-                        conn.execute(f"UPDATE {t} SET project_id=? WHERE project_id=? AND file_path=?",
-                                     (keep, dup, p))
             conn.execute("DELETE FROM meta WHERE key=?", (f"overview:{dup}",))
             conn.execute("DELETE FROM projects WHERE id=?", (dup,))
-            orphan_dup_pids.append(dup)
+            dup_pids.append(dup)
             if active == dup:
                 active = keep
-
-        # 2) Canonicalize root cua keep (gio root canonical da trong)
+        # Canonicalize root keep + invalidate overview (path da doi)
         cur = conn.execute("SELECT root FROM projects WHERE id=?", (keep,)).fetchone()
         if cur and cur["root"] != canon:
             conn.execute("UPDATE projects SET root=? WHERE id=?", (canon, keep))
-            for f in conn.execute("SELECT path FROM files WHERE project_id=?", (keep,)).fetchall():
-                np = os.path.normcase(f["path"])
-                if np != f["path"] and not conn.execute(
-                        "SELECT 1 FROM files WHERE project_id=? AND path=?", (keep, np)).fetchone():
-                    conn.execute("UPDATE files SET path=? WHERE project_id=? AND path=?",
-                                 (np, keep, f["path"]))
-                    for t in ("symbols", "edges", "routes"):
-                        conn.execute(f"UPDATE {t} SET file_path=? WHERE project_id=? AND file_path=?",
-                                     (np, keep, f["path"]))
+            conn.execute("DELETE FROM meta WHERE key=?", (f"overview:{keep}",))
 
     if active is not None:
         conn.execute("INSERT INTO meta(key,value) VALUES('active_project_id',?) "
                      "ON CONFLICT(key) DO UPDATE SET value=?", (str(active), str(active)))
-    # Best-effort: don vector orphan cua dup pids
-    if orphan_dup_pids:
-        try:
-            from . import vectors
-            for dp in orphan_dup_pids:
-                vectors.delete_project(dp)
-        except Exception:
-            pass
+
+    # Best-effort don vector orphan (dup project + file da doi path/project)
+    try:
+        from . import vectors
+        for dp in dup_pids:
+            vectors.delete_project(dp)
+        for (pidx, path) in vec_cleanup:
+            vectors.delete_file(path, project_id=pidx)
+    except Exception:
+        pass
 
 
 # ============================================================

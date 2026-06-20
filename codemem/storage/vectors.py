@@ -34,8 +34,23 @@ def get_collection():
         return None
 
 
-# Trang thai delete: phan biet absent (khong co gi de xoa = thanh cong) vs unavailable/error.
-_ABSENT, _UNAVAILABLE = "absent", "unavailable"
+def _is_absent(exc) -> bool:
+    """True neu exception nghia la 'collection khong ton tai' (KHONG phai loi IO/corrupt).
+    Phan biet bang loai exception, khong catch-all (#P0-10)."""
+    try:
+        import chromadb.errors as ce
+        not_found = getattr(ce, "NotFoundError", None)
+        if not_found is not None and isinstance(exc, not_found):
+            return True
+    except Exception:
+        pass
+    name = type(exc).__name__.lower()
+    if "notfound" in name:
+        return True
+    if isinstance(exc, ValueError):   # chroma cu: ValueError("Collection ... does not exist")
+        msg = str(exc).lower()
+        return "does not exist" in msg or "not found" in msg or "no such" in msg
+    return False                      # RuntimeError/IO/khac -> KHONG coi la absent
 
 
 def _client():
@@ -79,8 +94,11 @@ def _delete_where(where):
         return False                       # unavailable -> KHONG dam bao da xoa
     try:
         col = cl.get_collection(CHROMA_COLLECTION)
-    except Exception:
-        return True                        # collection absent -> khong co gi de xoa = OK
+    except Exception as e:
+        if _is_absent(e):
+            return True                    # collection thuc su khong co -> khong gi de xoa = OK
+        print(f"[warn] vector get_collection loi (KHONG phai absent): {e}")
+        return False                       # loi IO/corrupt -> bao that bai that
     try:
         col.delete(where=where)
         return True
@@ -110,8 +128,7 @@ def clear_all():
     try:
         cl.delete_collection(CHROMA_COLLECTION)
     except Exception as e:
-        msg = str(e).lower()
-        if "exist" in msg or "not found" in msg or "does not" in msg:
+        if _is_absent(e):
             ok = True                      # khong co collection = da sach
         else:
             print(f"[warn] vector clear_all delete_collection loi: {e}")
