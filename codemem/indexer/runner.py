@@ -42,9 +42,35 @@ def _index_one(spath, lang, h, root, pid, progress=None):
     return vec_ok
 
 
+def ensure_embed_current():
+    """Dung chung cho startup/manual/index: doi embedding model -> mark moi vector stale (#P0-5)."""
+    from ..config import EMBED_MODEL
+    if db.get_meta("embed_model") != EMBED_MODEL:
+        db.mark_all_vectors_stale()
+        db.set_meta("embed_model", EMBED_MODEL)
+        return True
+    return False
+
+
+def _retry_tombstones():
+    """Retry cac vector delete tung that bai (#P0-10). Goi trong reconcile."""
+    cleared = 0
+    for t in db.list_tombstones():
+        if t["scope"] == "project":
+            ok = vectors.delete_project(t["project_id"])
+        else:
+            ok = vectors.delete_file(t["file_path"], project_id=t["project_id"])
+        if ok:
+            db.del_tombstone(t["id"])
+            cleared += 1
+    return cleared
+
+
 @_locked
 def reconcile_vectors(pid, progress=None):
-    """Repair vector cho file co trong SQLite nhung vector pending/thieu (#P0-5)."""
+    """Repair vector pending/thieu + retry tombstone delete (#P0-5/#P0-10)."""
+    ensure_embed_current()
+    tomb = _retry_tombstones()
     repaired = still_pending = 0
     for f in db.files_pending_vector(pid):
         syms = db.get_symbols_for_file(f["path"], project_id=pid)
@@ -54,21 +80,16 @@ def reconcile_vectors(pid, progress=None):
             repaired += 1
         else:
             still_pending += 1
-    if progress and (repaired or still_pending):
-        progress(f"reconcile vector: repaired={repaired}, pending={still_pending}")
-    return {"repaired": repaired, "pending": still_pending}
+    if progress and (repaired or still_pending or tomb):
+        progress(f"reconcile: repaired={repaired}, pending={still_pending}, tombstones_cleared={tomb}")
+    return {"repaired": repaired, "pending": still_pending, "tombstones_cleared": tomb}
 
 
 @_locked
 def index_project(root: str, progress=None):
     """Index project tai 'root' (incremental). KHONG wipe project khac."""
     db.init_db()
-    # Doi embedding model -> moi vector stale, danh dau de reconcile (#P0-5)
-    from ..config import EMBED_MODEL
-    if db.get_meta("embed_model") != EMBED_MODEL:
-        db.mark_all_vectors_stale()
-        db.set_meta("embed_model", EMBED_MODEL)
-
+    ensure_embed_current()                 # doi embedding model -> mark stale (#P0-5)
     root = canonical_root(root)
     pid = db.get_or_create_project(root)
     db.set_active_project(pid)
@@ -100,7 +121,8 @@ def index_project(root: str, progress=None):
     removed = [p for p in existing if p not in seen]
     for p in removed:
         db.delete_file(p, project_id=pid)
-        vectors.delete_file(p, project_id=pid)
+        if not vectors.delete_file(p, project_id=pid):
+            db.add_tombstone(pid, p, "file")     # vector delete fail -> retry sau (#P0-10)
 
     # Repair vector pending (ke ca file unchanged nhung vector tung loi)
     rec = reconcile_vectors(pid, progress)
@@ -139,4 +161,5 @@ def remove_file(path: str, project_id=None):
     pid = project_id if project_id is not None else db.active_project_id()
     sp = os.path.normcase(str(Path(path)))
     db.delete_file(sp, project_id=pid)
-    vectors.delete_file(sp, project_id=pid)
+    if not vectors.delete_file(sp, project_id=pid):
+        db.add_tombstone(pid, sp, "file")        # vector delete fail -> retry sau (#P0-10)

@@ -99,7 +99,8 @@ def test_canonical_root_merge_migration(tmp_path, monkeypatch):
                  "VALUES (?,?,?,?,?,?,?,1)", (p1, "C:\\Repo\\App\\x.py", "python", "h1", "s1", "2026-01-01", ""))
     conn.execute("INSERT INTO files(project_id,path,lang,hash,skeleton,indexed_at,summary,vector_ok) "
                  "VALUES (?,?,?,?,?,?,?,1)", (p2, "c:\\repo\\app\\x.py", "python", "h2", "s2", "2026-02-01", ""))
-    conn.execute("DELETE FROM meta WHERE key='roots_canon_v1'")
+    conn.execute("INSERT INTO meta(key,value) VALUES (?,?)", (f"overview:{p1}", "OLD OVERVIEW"))
+    conn.execute("DELETE FROM meta WHERE key='roots_canon_v2'")
     conn.commit()
     conn.close()
 
@@ -111,6 +112,7 @@ def test_canonical_root_merge_migration(tmp_path, monkeypatch):
     assert db.get_status(pid)["files"] == 1        # 2 file cung normcase -> 1
     f = db.get_file_row("c:\\repo\\app\\x.py", project_id=pid)
     assert f is not None and f["vector_ok"] == 0   # path doi -> mark re-embed
+    assert db.get_overview(pid) == ""              # #P0-8: overview cu bi invalidate khi merge
 
 
 def test_indexed_hashes_scoped(tmp_path, monkeypatch):

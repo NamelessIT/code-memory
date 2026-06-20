@@ -55,6 +55,11 @@ def init_db():
             method TEXT, path TEXT, handler TEXT, line INTEGER
         );
         CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+        -- Vector delete that bai sau khi SQLite da xoa -> luu de retry (#P0-10)
+        CREATE TABLE IF NOT EXISTS vector_tombstones (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER, file_path TEXT, scope TEXT, created_at TEXT
+        );
     """)
     # Migration cot cho DB cu (truoc multi-project)
     for stmt in (
@@ -105,11 +110,12 @@ def init_db():
         conn.execute("INSERT INTO meta(key,value) VALUES('active_project_id',?) "
                      "ON CONFLICT(key) DO UPDATE SET value=?", (str(pid), str(pid)))
 
-    # Canonicalize + merge project trung canonical-root (Windows casing/separator) - #P0-8
-    rc = conn.execute("SELECT value FROM meta WHERE key='roots_canon_v1'").fetchone()
+    # Canonicalize + merge project trung canonical-root (Windows casing/separator) - #P0-8.
+    # Marker v2: DB da chay v1 (ban loi) van phai re-run ban da sua.
+    rc = conn.execute("SELECT value FROM meta WHERE key='roots_canon_v2'").fetchone()
     if not rc or rc["value"] != "1":
         _migrate_canonical_roots(conn)
-        conn.execute("INSERT INTO meta(key,value) VALUES('roots_canon_v1','1') "
+        conn.execute("INSERT INTO meta(key,value) VALUES('roots_canon_v2','1') "
                      "ON CONFLICT(key) DO UPDATE SET value='1'")
 
     # Doi schema version -> invalidate overview/summary cu (hallucination legacy)
@@ -157,6 +163,7 @@ def _migrate_canonical_roots(conn):
 
     for canon, ids in groups.items():
         keep = ids[0]
+        group_changed = len(ids) > 1     # co dup project -> chac chan merge
         # Gom tat ca file trong nhom (moi project id)
         files = []
         for pidx in ids:
@@ -177,6 +184,7 @@ def _migrate_canonical_roots(conn):
             if (pidx, path) not in survivors:
                 _del_file(pidx, path)
                 vec_cleanup.append((pidx, path))
+                group_changed = True
 
         # Dua survivor ve (keep, nkey)
         for nkey, (pidx, path, ts) in best.items():
@@ -188,6 +196,7 @@ def _migrate_canonical_roots(conn):
             conn.execute("UPDATE files SET project_id=?, path=?, vector_ok=0 WHERE project_id=? AND path=?",
                          (keep, nkey, pidx, path))
             vec_cleanup.append((pidx, path))      # vector ID cu (pidx, path) khac (keep, nkey)
+            group_changed = True
 
         # Xoa cac dup project + overview
         for dup in ids[1:]:
@@ -196,10 +205,13 @@ def _migrate_canonical_roots(conn):
             dup_pids.append(dup)
             if active == dup:
                 active = keep
-        # Canonicalize root keep + invalidate overview (path da doi)
+        # Canonicalize root keep
         cur = conn.execute("SELECT root FROM projects WHERE id=?", (keep,)).fetchone()
         if cur and cur["root"] != canon:
             conn.execute("UPDATE projects SET root=? WHERE id=?", (canon, keep))
+            group_changed = True
+        # Bat ky merge/move/root-change -> overview cu da stale
+        if group_changed:
             conn.execute("DELETE FROM meta WHERE key=?", (f"overview:{keep}",))
 
     if active is not None:
@@ -380,6 +392,29 @@ def set_vector_ok(path, ok, project_id):
     conn = _conn()
     conn.execute("UPDATE files SET vector_ok=? WHERE project_id=? AND path=?",
                  (1 if ok else 0, project_id, path))
+    conn.commit()
+    conn.close()
+
+
+def add_tombstone(project_id, file_path=None, scope="file"):
+    """Ghi 1 vector delete that bai de retry sau (#P0-10)."""
+    conn = _conn()
+    conn.execute("INSERT INTO vector_tombstones(project_id, file_path, scope, created_at) VALUES (?,?,?,?)",
+                 (project_id, file_path, scope, datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+
+def list_tombstones(limit=500):
+    conn = _conn()
+    rows = conn.execute("SELECT * FROM vector_tombstones ORDER BY id LIMIT ?", (limit,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def del_tombstone(tid):
+    conn = _conn()
+    conn.execute("DELETE FROM vector_tombstones WHERE id=?", (tid,))
     conn.commit()
     conn.close()
 

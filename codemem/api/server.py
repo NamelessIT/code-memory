@@ -76,9 +76,9 @@ def projects():
 def project_select(body: ProjectBody):
     """Doi project active: KHONG wipe; reset chat; chuyen watcher. Toan bo stop->mutate->start
     trong INDEX_LOCK de khong interleave voi index/flush (#P0-6)."""
-    if not db.project_exists(body.id):
-        return JSONResponse({"error": "Project khong ton tai"}, status_code=404)
     with INDEX_LOCK:
+        if not db.project_exists(body.id):   # check trong lock -> khong race voi delete
+            return JSONResponse({"error": "Project khong ton tai"}, status_code=404)
         watcher.stop()
         db.set_active_project(body.id)
         session.history.clear()             # khong mang history sang project khac
@@ -99,15 +99,17 @@ def project_select(body: ProjectBody):
 @app.post("/api/project/delete")
 def project_delete(body: ProjectBody):
     """Xoa 1 project (SQLite + vector) - KHONG dung den project khac."""
-    if not db.project_exists(body.id):
-        return JSONResponse({"error": "Project khong ton tai"}, status_code=404)
-    # Toan bo stop->mutate->start trong lock (#P0-6) de state khong stale.
+    # Toan bo check->stop->mutate->start trong lock (#P0-6) de khong race voi index/select.
     with INDEX_LOCK:
+        if not db.project_exists(body.id):
+            return JSONResponse({"error": "Project khong ton tai"}, status_code=404)
         if db.active_project_id() == body.id:
             watcher.stop()
             session.history.clear()
         db.delete_project(body.id)          # tu chon active ke tiep neu xoa active
         vec_ok = vectors.delete_project(body.id)
+        if not vec_ok:
+            db.add_tombstone(body.id, None, "project")   # retry xoa vector sau (#P0-10)
         p = db.get_active_project()
         if p and os.path.isdir(p["root"]):
             try:

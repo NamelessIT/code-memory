@@ -28,22 +28,22 @@
 
 ## Baseline đã được Codex xác minh
 
-- Reviewed implementation commit: 90f1e6d; report commit: 4a48e53.
-- Full suite: 36 passed.
+- Reviewed implementation commit: 3bbe07f; report commit: 2489cc1.
+- Full suite: 37 passed.
 - python -m compileall -q codemem: pass.
 - node --check web/app.js: pass.
-- P0 đã xác minh và đã xóa/thu gọn: vector delete project-scoped, watcher bind project+generation, INDEX_LOCK cơ bản, persistent vector_ok/reconcile cơ bản, embed-model marker, partial response cơ bản và các fix vòng trước.
+- P0 đã xác minh và đã xóa/thu gọn: typed absent-vs-error vector delete, lifecycle INDEX_LOCK cơ bản, normcase file merge cơ bản, reconcile on project switch và các fix vòng trước.
 - Không được làm regression các phần trên.
 
 ## ACTIVE TASKS
 
 ### P0-5 — Hoàn thiện vector reconciliation lifecycle
 
-files.vector_ok, startup/manual reconcile và embed-model marker đã có. Phần còn lại:
+files.vector_ok, startup/manual/switch reconcile và embed-model marker đã có. Phần còn lại:
 
 - Reconcile chỉ thấy vector_ok=0; collection mất/corrupt bên ngoài trong khi DB còn 1 không được phát hiện.
 - Embed-model staleness check chỉ chạy trong index_project; đổi CODEMEM_EMBED_MODEL rồi restart hoặc gọi /api/reconcile trước khi index không mark stale.
-- mark_all_vectors_stale áp dụng mọi project nhưng startup chỉ reconcile active project; project khác không tự repair khi switch.
+- mark_all_vectors_stale áp dụng mọi project nhưng startup chỉ reconcile active; project khác chỉ repair khi được switch tới.
 - Summary embeddings chưa có trạng thái pending/version/reconcile.
 - Chưa có inventory/content hash để đối chiếu vector thực tế; UI chưa surface pending/repair.
 - Lưu embedding model/version/content hash hoặc inventory; check staleness phải dùng chung cho startup, manual và index.
@@ -51,31 +51,27 @@ files.vector_ok, startup/manual reconcile và embed-model marker đã có. Phầ
 
 ### P0-6 — Serialize index/watch/delete concurrency
 
-INDEX_LOCK đã serialize các hàm runner và clear/delete cơ bản. Phần còn lại:
+INDEX_LOCK đã bao stop → mutate → start cho index/select/delete. Phần còn lại:
 
-- /api/index gọi watcher.stop trước lock và watcher.start sau khi lock đã nhả; /api/project/select không dùng INDEX_LOCK. Select có thể interleave và bật watcher khác với active project.
-- project_delete kiểm tra active/stop watcher trước khi vào lock, nên state có thể stale.
+- project_select và project_delete vẫn check project_exists ngoài lock; project có thể bị xóa giữa check và mutate, trong khi return value set_active bị bỏ qua.
 - Generation guard không dừng callback đã qua bước copy pending và đang ghi; chỉ INDEX_LOCK làm nó chờ, không hủy.
 - Summarizer vẫn ngoài lock và có thể ghi summary/vector/overview song song index/delete.
 - Error mới chỉ print; chưa vào structured job log/retry.
-- Lock/job coordinator phải bao cả lifecycle stop → mutate → start, có thứ tự lock và deterministic API concurrency tests.
+- Cần deterministic API concurrency tests cho index/select/delete/watcher/summarizer.
 
-### P0-8 — Sửa canonical-root migration với file dữ liệu thật
+### P0-8 — Hoàn thiện canonical-root migration rollout
 
-Migration đã merge project roots rỗng, nhưng merge file chỉ so exact path trước khi normcase.
+Normcase file dedup đã sửa và test có file thật. Phần còn lại:
 
-- Codex repro: C:\Repo\App\x.py và c:\repo\app\x.py sau migration vẫn thành hai rows trong cùng project.
-- Row path của project keep có thể bị đổi casing mà không set vector_ok=0; vector ID/metadata cũ vẫn được tin là hợp lệ.
-- Test hiện chỉ merge hai project không có files nên không bắt lỗi.
-- Merge theo canonical relative path, giải quyết conflict bằng hash/indexed_at rõ ràng, không mất symbol/summary mới hơn.
-- Mọi path/ID đổi phải mark vector stale; invalidate overview; dọn orphan có tombstone/retry.
-- Dùng marker migration version mới, backup/rollback; test casing/separator và junction thật hoặc adapter deterministic.
+- Code vẫn dùng guard roots_canon_v1. DB đã chạy migration v1 lỗi ở round trước sẽ bỏ qua implementation mới; Codex repro vẫn còn 2 projects.
+- Nếu keep root đã canonical nhưng merge thêm file từ dup, overview:{keep} không bị invalidate; Codex repro trả overview cũ STALE.
+- Vector cleanup chạy best-effort bên trong migration trước commit, không có tombstone/retry; crash/failure có thể để DB/vector lệch.
+- Bump marker/version migration, luôn invalidate derived overview khi group merge/path đổi, backup/rollback.
+- Test upgrade từ DB đã có roots_canon_v1=1, overview merge, cleanup failure và junction thật/adapter deterministic.
 
 ### P0-10 — Mutation SQLite/vector chưa có partial-result contract
 
-- clear_all đã trả False cho delete_collection error cơ bản, nhưng boolean vẫn chưa hoàn toàn đáng tin.
-- _delete_where coi mọi exception từ get_collection() là “absent” và trả True. Codex repro RuntimeError("disk io error") → delete_project=True.
-- Phân biệt absent bằng exception type/code thay vì mọi lỗi hoặc substring message.
+- Typed absent/error và boolean response đã đạt.
 - SQLite delete trước vector delete nhưng không lưu tombstone/pending cleanup khi vector fail.
 - Lưu retryable cleanup/tombstone, có API/job retry và hiển thị partial/retry UI.
 
@@ -235,33 +231,5 @@ Lệnh kiểm tra tối thiểu:
 ## CLAUDE_REPORT — temporary handoff
 
 <!-- CLAUDE_REPORT_START -->
-## Vòng — P0 round 4 (refinements P0-5/6/8/10)
-
-**Commit:** work `3bbe07f` (report commit ngay sau). **Working tree:** clean sau report.
-**Env:** Python 3.12.13 (venv Ollama), chromadb 1.5.9, watchdog 6.0.0.
-
-### Task đã xử lý
-- **P0-10 (absent vs error đúng):** thêm `_is_absent(exc)` phân biệt bằng **loại exception** — `chromadb.errors.NotFoundError` hoặc `ValueError("...does not exist")` = absent (True); `RuntimeError`/IO/corrupt = lỗi thật (False). `_delete_where` + `clear_all` dùng nó → repro `RuntimeError("disk io error") → delete_project=True` của Codex đã hết (giờ False).
-- **P0-6 (locked lifecycle):** `/api/index`, `/api/project/select`, `/api/project/delete` bọc **toàn bộ stop→mutate→start** trong `INDEX_LOCK` (RLock; `index_project` reentrant). Select không còn `set_active` ngoài lock hay bật watcher lệch active. Delete kiểm tra active + stop + xoá + start đều trong lock.
-- **P0-8 (merge file theo normcase):** `_migrate_canonical_roots` viết lại — gom mọi file trong nhóm canonical, **dedup theo `os.path.normcase(path)`** (giữ `indexed_at` mới nhất), đưa survivor về `(keep, nkey)` + `vector_ok=0`, dọn vector cũ (dup project + file đổi path). Sửa repro `C:\Repo\App\x.py` vs `c:\repo\app\x.py` → 1 row.
-- **P0-5 (repair on switch):** `/api/project/select` chạy `reconcile_vectors(new)` ở background; startup reconcile + `/api/reconcile` + embed-model staleness (vòng trước) vẫn còn.
-
-### File/API đã đổi
-- `codemem/storage/vectors.py`: `_is_absent`; `_delete_where`/`clear_all` semantics theo exception type.
-- `codemem/storage/db.py`: `_migrate_canonical_roots` dedup normcase + vector cleanup list.
-- `codemem/api/server.py`: index/select/delete bọc INDEX_LOCK trọn lifecycle; select background reconcile.
-
-### Test + kết quả
-- `python -m pytest tests -q` → **37 passed** (mới: canonical merge có file thật → 1 project/1 file/vector_ok=0; delete IO-error→False; absent→True; clear_all real-error→False).
-- `compileall` pass; `node --check web/app.js` pass.
-- Smoke server: `/api/health` chroma+embedding ok, `active_project` + `watcher:true`; `/api/projects` root đã canonical `c:\github\...`; `/api/reconcile` → repaired 0/pending 0.
-
-### Partial / chưa làm
-- **P0-5**: vẫn **chưa có inventory/content-hash đối chiếu vector thực tế** (collection mất/corrupt ngoài khi DB vector_ok=1 → chưa phát hiện); summary-embedding chưa có version/pending; startup chỉ reconcile **active** project (project khác repair khi switch, chưa repair tất cả lúc khởi động).
-- **P0-6**: generation guard vẫn **không hủy callback đã qua copy pending đang ghi** (INDEX_LOCK chỉ làm nó chờ tuần tự, không cancel mid-write); **summarizer vẫn ngoài INDEX_LOCK** (có thể ghi summary/vector song song index/delete — gắn P1-16); chưa có structured job log/retry; chưa có deterministic API-concurrency test (mới có unit test watcher + lock reentrancy gián tiếp).
-- **P0-8**: chưa migration-version mới + backup/rollback chính thức (dùng guard `roots_canon_v1`); chưa test junction thật (chỉ casing/separator). Vector orphan cleanup là best-effort trong try/except.
-- **P0-10**: chưa lưu **tombstone/retryable cleanup** khi SQLite delete xong nhưng vector delete fail (mới trả False + log; cần job retry + UI).
-
-### Regression
-- Không có. 37/37 pass gồm toàn bộ test cũ; smoke health chroma true (ef-poison vẫn fixed).
+Claude Code: thay placeholder này bằng báo cáo của vòng triển khai mới. Không xóa marker.
 <!-- CLAUDE_REPORT_END -->
