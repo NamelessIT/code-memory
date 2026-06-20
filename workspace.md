@@ -235,5 +235,34 @@ Lệnh kiểm tra tối thiểu:
 ## CLAUDE_REPORT — temporary handoff
 
 <!-- CLAUDE_REPORT_START -->
-Claude Code: thay nội dung này bằng báo cáo triển khai mới sau khi hoàn thành task.
+## Vòng — P0-10 transactional outbox (kèm schema-preserve, project-independent worker, fence)
+
+**Commit:** work `5599a9e` (report commit ngay sau). **Working tree:** clean sau report.
+**Env:** Python 3.12.13 (venv Ollama), chromadb 1.5.9, watchdog 6.0.0.
+
+### Task đã xử lý (P0-10)
+- **Schema upgrade GIỮ row (repro 1→1):** v1→v2 không DROP mất dữ liệu nữa — `ALTER RENAME` → `CREATE` v2 → `INSERT OR IGNORE SELECT COALESCE(...)` → `DROP` bảng cũ. Test bảo toàn row.
+- **Transactional outbox:** `db.delete_file`/`db.delete_project` ghi cleanup intent **trong cùng transaction SQLite** với việc xoá row; caller gọi `vectors.delete_*` rồi `db.ack_tombstone(...)` khi thành công. Crash/exception giữa 2 bước → intent đã durable → worker dọn sau (hết orphan-không-intent). `/api/clear`: `add_tombstone("collection")` **trước** `vectors.clear_all()`, ack khi ok.
+- **Project-independent cleanup:** `runner.cleanup_worker()` retry mọi scope không cần active project; `/api/cleanup/retry` endpoint + chạy ở **startup background** → intent được dọn kể cả sau khi clear/xoá hết project (trước đây `/api/reconcile` trả 400, intent kẹt vĩnh viễn).
+- **Collection fence:** `index_project` xử lý collection intent **trước** khi ghi vector; reconcile sau index dùng `include_collection=False` → không wipe collection vừa index. Test `scopes` filter.
+- **last_error thật:** `vectors.last_error()` (get_collection/delete/clear lưu message) → `record_tombstone_failure(id, err)` thay vì chuỗi chung.
+
+### File/API đã đổi
+- `codemem/storage/db.py`: schema v1→v2 preserve; `delete_file`/`delete_project` ghi intent atomic; `ack_tombstone`.
+- `codemem/storage/vectors.py`: `last_error()` + set `_last_error` ở delete/clear failures.
+- `codemem/indexer/runner.py`: `_retry_tombstones(scopes=)`, `cleanup_worker()`, `reconcile_vectors(include_collection=)`, index fence + ack outbox.
+- `codemem/api/server.py`: `/api/cleanup/retry`; `/api/clear` outbox; delete ack; startup cleanup worker.
+
+### Test + kết quả
+- `python -m pytest tests -q` → **49 passed** (mới: schema-v1-preserve, outbox delete_file/project intent+ack, cleanup_worker independent, scopes-filter fence, collapse-then-project-intent, real last_error). `compileall` + `node --check` pass; **26 routes**.
+- Live smoke: `/api/health` → `cleanup:{pending,failed,last_error}`; `/api/cleanup/retry` → 200 `{cleared, cleanup}`. Real DB intact 27 file / vector_pending 0.
+
+### Partial / chưa làm
+- **P0-10 còn lại — generation/content-hash trên intent:** tombstone vẫn chỉ `(scope,pid,path)`, **chưa có generation/hash** → file được re-index trong lúc backoff vẫn có thể bị intent cũ xoá vector mới (Codex repro delete-success-nhưng-vector_ok=1 chưa fix). Cần gắn generation/hash vào intent + so khớp trước khi xoá. Backoff chưa có jitter; chưa surface retry/action trong **UI**.
+- **P0-8**: vẫn marker boolean (`roots_canon_v2`) — chưa migration-version/ledger + backup/rollback; chưa test junction thật + process-interruption giữa transform và retry.
+- **P0-6**: generation guard chưa hủy callback đang ghi dở; chưa **re-check project-exists sau khi lấy INDEX_LOCK** trong watcher callback (callback cũ vẫn có thể ghi cho pid đã xoá); **summarizer vẫn ngoài lock**; chưa có deterministic API-concurrency test. → P1-16.
+- **P0-5**: collection generation theo embed-model (dimension/config) + inventory/content-hash + summary-embedding version vẫn chưa làm.
+
+### Regression
+- Không. 49/49 pass; health chroma true; DB thật nguyên vẹn.
 <!-- CLAUDE_REPORT_END -->
