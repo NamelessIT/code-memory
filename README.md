@@ -38,6 +38,17 @@ pip install -r requirements.txt
 2. Chờ index xong (lần đầu lâu, lần sau chỉ index file thay đổi).
 3. Hỏi: "hàm X làm gì?", "luồng đăng nhập chạy thế nào?", "class Y nằm ở đâu?"...
 
+## Tests
+
+```powershell
+python -m pytest tests -q
+```
+Bao gồm: parser (Python/JS/C#), regression tag path, retrieval grounding (insufficient evidence + threshold), summarizer (không lưu lỗi làm summary).
+
+## Cấu hình (env, không hard-code)
+
+`CODEMEM_MODEL`, `CODEMEM_NUM_CTX`, `CODEMEM_OLLAMA_URL`, `CODEMEM_EMBED_MODEL`, `CODEMEM_SEMANTIC_MAX_DISTANCE`, `CODEMEM_USE_BRAIN`. Model thật xem `/api/models`.
+
 ## Kiến trúc
 
 ```

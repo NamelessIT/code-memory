@@ -1,100 +1,113 @@
-"""Hybrid retrieval: semantic (Chroma) + keyword (SQLite) -> context pack."""
-from ..config import TOP_K, CONTEXT_CHAR_BUDGET
+"""Hybrid retrieval co grounding: semantic (nguong distance) + lexical (token) -> context pack."""
+import os
+import re
+
+from ..config import TOP_K, CONTEXT_CHAR_BUDGET, SEMANTIC_MAX_DISTANCE
 from ..storage import db, vectors
+
+_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
+
+
+def _rel(path):
+    root = db.get_meta("project_root")
+    if root:
+        try:
+            return os.path.relpath(path, root).replace("\\", "/")
+        except ValueError:
+            pass
+    return path
 
 
 def _candidates(query: str):
-    """Gop ket qua semantic + keyword, giu thu tu uu tien, loai trung."""
-    seen = set()
-    out = []
+    """Gop semantic (loc theo nguong) + lexical (theo tung token). Loai trung."""
+    seen, out = set(), []
 
-    # 1) Semantic (uu tien cao)
+    # 1) Semantic — chi giu cai du gan (distance <= nguong)
     for m in vectors.query(query, n=TOP_K):
-        if m.get("kind") == "file":
+        if m.get("kind") in ("file", "summary"):
+            continue
+        dist = m.get("_distance")
+        if dist is not None and dist > SEMANTIC_MAX_DISTANCE:
             continue
         key = (m.get("file_path"), m.get("name"))
         if key in seen:
             continue
         seen.add(key)
-        out.append({
-            "file_path": m.get("file_path"),
-            "name": m.get("name"),
-            "kind": m.get("kind"),
-            "start_line": m.get("start_line"),
-            "signature": None,
-        })
+        out.append({"file_path": m.get("file_path"), "name": m.get("name"),
+                    "kind": m.get("kind"), "start_line": m.get("start_line"),
+                    "signature": None, "score": dist})
 
-    # 2) Keyword (bo sung)
-    for s in db.search_symbols(query, limit=15):
-        key = (s["file_path"], s["name"])
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append({
-            "file_path": s["file_path"],
-            "name": s["name"],
-            "kind": s["kind"],
-            "start_line": s["start_line"],
-            "signature": s["signature"],
-        })
-
+    # 2) Lexical — tach cau hoi thanh token, tim symbol theo tung token
+    tokens = {t.lower() for t in _WORD.findall(query)}
+    for tok in tokens:
+        for s in db.search_symbols(tok, limit=8):
+            key = (s["file_path"], s["name"])
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({"file_path": s["file_path"], "name": s["name"],
+                        "kind": s["kind"], "start_line": s["start_line"],
+                        "signature": s["signature"], "score": None})
     return out
 
 
 def build_context(query: str):
-    """
-    Tra ve (context_text, sources).
-    context_text: gom danh sach symbol lien quan + skeleton cac file lien quan, <= budget.
-    sources: list file_path da dung.
-    """
+    """Tra ve (context_text, sources_relative). Rong -> khong du chung cu."""
     cands = _candidates(query)
     if not cands:
         return "", []
 
     lines = []
-    # Project overview (neu da tom tat - Phase 3)
     overview = db.get_meta("overview")
     if overview:
-        lines.append("=== TỔNG QUAN DỰ ÁN ===")
-        lines.append(overview[:1200])
-        lines.append("")
+        lines += ["=== TONG QUAN DU AN (do AI tom tat tu evidence) ===", overview[:1200], ""]
 
-    # Danh sach symbol lien quan (lay signature tu DB neu thieu)
     lines.append("=== SYMBOL LIEN QUAN ===")
     files_order = []
     for c in cands[:15]:
         sig = c["signature"]
         if not sig and c["name"]:
-            rows = db.get_symbols_by_name(c["name"], limit=1)
-            sig = rows[0]["signature"] if rows else ""
-        loc = f"{c['file_path']}"
-        if c.get("start_line"):
-            loc += f":{c['start_line']}"
+            row = db.get_symbol_in_file(c["name"], c["file_path"])  # file-scoped, dung signature
+            sig = row["signature"] if row else ""
+        loc = _rel(c["file_path"]) + (f":{c['start_line']}" if c.get("start_line") else "")
         lines.append(f"- [{c['kind']}] {c['name']}  ({loc})")
         if sig:
             lines.append(f"    {sig}")
         if c["file_path"] not in files_order:
             files_order.append(c["file_path"])
 
-    # Call graph cho vai symbol dau (ai goi / goi ai)
-    cg = ["\n=== CALL GRAPH (LIEN QUAN) ==="]
+    # Evidence: than ham/doc cho vai symbol dau (de giai thich 'lam gi')
+    ev = ["\n=== EVIDENCE (trich nguyen van tu source) ==="]
+    for c in cands[:3]:
+        row = db.get_symbol_in_file(c["name"], c["file_path"]) if c["name"] else None
+        if not row:
+            continue
+        loc = _rel(c["file_path"]) + f":{row.get('start_line','')}"
+        body = (row.get("body") or "").strip()
+        doc = (row.get("doc") or "").strip()
+        if doc:
+            ev.append(f"# {c['name']} ({loc}) doc: {doc[:200]}")
+        if body:
+            ev.append(f"# {c['name']} ({loc})\n{body}")
+    if len(ev) > 1:
+        lines += ev
+
+    # Call graph — CHI hien edge resolve duoc toi symbol noi bo (loai built-in/external)
+    cg = ["\n=== CALL GRAPH (noi bo) ==="]
     for c in cands[:3]:
         nm = c["name"]
         if not nm:
             continue
-        callees = db.get_callees(nm, limit=8)
-        callers = db.get_callers(nm, limit=8)
+        callees = [x for x in db.get_callees(nm, 12) if db.symbol_exists(x)]
+        callers = [x for x in db.get_callers(nm, 12) if db.symbol_exists(x)]
         if callees or callers:
-            cg.append(f"{nm}:")
-            if callees:
-                cg.append(f"  goi -> {', '.join(callees)}")
-            if callers:
-                cg.append(f"  duoc goi boi <- {', '.join(callers)}")
+            cg.append(f"{nm}: goi -> [{', '.join(callees)}] | duoc goi boi <- [{', '.join(callers)}]")
     if len(cg) > 1:
-        lines.extend(cg)
+        lines += cg
 
-    # Skeleton cac file lien quan, cat theo budget
     text = "\n".join(lines)
+
+    # Skeleton + summary cac file lien quan, cat theo budget
     used = []
     sk_parts = ["\n=== CAU TRUC FILE LIEN QUAN ==="]
     for fp in files_order:
@@ -102,12 +115,11 @@ def build_context(query: str):
         if not sk:
             continue
         summ = db.get_file_summary(fp)
-        block = (f"[TÓM TẮT] {summ}\n{sk}" if summ else sk)
+        block = (f"[TOM TAT] {summ}\n{sk}" if summ else sk)
         if len(text) + len("\n".join(sk_parts)) + len(block) > CONTEXT_CHAR_BUDGET:
             break
         sk_parts.append(block)
-        used.append(fp)
-
+        used.append(_rel(fp))
     if len(sk_parts) > 1:
         text += "\n" + "\n\n".join(sk_parts)
 
@@ -115,10 +127,12 @@ def build_context(query: str):
 
 
 def get_related(name: str):
-    """Thong tin call-graph cua 1 symbol (cho endpoint /api/related)."""
+    """Call-graph cua 1 symbol, chi giu edge noi bo da resolve."""
     return {
         "name": name,
-        "definitions": db.get_symbols_by_name(name, limit=10),
-        "calls": db.get_callees(name, limit=30),
-        "called_by": db.get_callers(name, limit=30),
+        "definitions": [
+            {**d, "rel_path": _rel(d["file_path"])} for d in db.get_symbols_by_name(name, 10)
+        ],
+        "calls": [x for x in db.get_callees(name, 30) if db.symbol_exists(x)],
+        "called_by": [x for x in db.get_callers(name, 30) if db.symbol_exists(x)],
     }

@@ -33,6 +33,8 @@ def init_db():
             parent TEXT,
             exported INTEGER DEFAULT 0,
             tag TEXT DEFAULT '',
+            doc TEXT DEFAULT '',
+            body TEXT DEFAULT '',
             FOREIGN KEY (file_path) REFERENCES files(path)
         );
         CREATE INDEX IF NOT EXISTS idx_sym_name ON symbols(name);
@@ -65,12 +67,25 @@ def init_db():
     # Migration: them cot cho DB cu
     for stmt in (
         "ALTER TABLE symbols ADD COLUMN tag TEXT DEFAULT ''",
+        "ALTER TABLE symbols ADD COLUMN doc TEXT DEFAULT ''",
+        "ALTER TABLE symbols ADD COLUMN body TEXT DEFAULT ''",
         "ALTER TABLE files ADD COLUMN summary TEXT DEFAULT ''",
     ):
         try:
             conn.execute(stmt)
         except sqlite3.OperationalError:
             pass
+
+    # Doi schema version -> invalidate overview/summary cu (co the la hallucination legacy)
+    from ..config import SCHEMA_VERSION
+    row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+    cur = row["value"] if row else None
+    if cur != SCHEMA_VERSION:
+        conn.execute("DELETE FROM meta WHERE key='overview'")
+        conn.execute("UPDATE files SET summary=''")
+        conn.execute(
+            "INSERT INTO meta(key,value) VALUES('schema_version',?) "
+            "ON CONFLICT(key) DO UPDATE SET value=?", (SCHEMA_VERSION, SCHEMA_VERSION))
     conn.commit()
     conn.close()
 
@@ -87,18 +102,20 @@ def upsert_file(path, lang, file_hash, skeleton, symbols, edges=None, routes=Non
     """Ghi file + thay toan bo symbol/edge/route cua file (xoa cu, them moi)."""
     conn = _conn()
     now = datetime.now().isoformat()
+    # File doi -> summary cu thanh stale (xoa de bat sinh lai). Phase 3 grounding.
     conn.execute(
-        "INSERT INTO files(path, lang, hash, skeleton, indexed_at) VALUES (?,?,?,?,?) "
-        "ON CONFLICT(path) DO UPDATE SET lang=?, hash=?, skeleton=?, indexed_at=?",
+        "INSERT INTO files(path, lang, hash, skeleton, indexed_at, summary) VALUES (?,?,?,?,?,'') "
+        "ON CONFLICT(path) DO UPDATE SET lang=?, hash=?, skeleton=?, indexed_at=?, summary=''",
         (path, lang, file_hash, skeleton, now, lang, file_hash, skeleton, now),
     )
     conn.execute("DELETE FROM symbols WHERE file_path=?", (path,))
     conn.executemany(
-        "INSERT INTO symbols(file_path, kind, name, signature, start_line, end_line, parent, exported, tag) "
-        "VALUES (?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO symbols(file_path, kind, name, signature, start_line, end_line, parent, exported, tag, doc, body) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         [
             (path, s["kind"], s["name"], s["signature"], s["start_line"],
-             s["end_line"], s.get("parent"), 1 if s.get("exported") else 0, s.get("tag", ""))
+             s["end_line"], s.get("parent"), 1 if s.get("exported") else 0,
+             s.get("tag", ""), s.get("doc", ""), s.get("body", ""))
             for s in symbols
         ],
     )
@@ -147,6 +164,24 @@ def get_symbols_by_name(name, limit=10):
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def get_symbol_in_file(name, file_path):
+    """Lay symbol theo ten + dung file (tranh lay nham signature definition khac)."""
+    conn = _conn()
+    row = conn.execute(
+        "SELECT * FROM symbols WHERE name=? AND file_path=? LIMIT 1", (name, file_path)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def symbol_exists(name):
+    """True neu 'name' la symbol noi bo da index (de loc built-in/external khoi call graph)."""
+    conn = _conn()
+    row = conn.execute("SELECT 1 FROM symbols WHERE name=? LIMIT 1", (name,)).fetchone()
+    conn.close()
+    return row is not None
 
 
 def get_symbols_for_files(paths):

@@ -1,12 +1,13 @@
 """FastAPI: API code-memory + phuc vu Web UI."""
 import json
+import os
 
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from ..config import WEB_DIR, HOST, PORT
+from ..config import WEB_DIR, HOST, PORT, MODEL, NUM_CTX, OLLAMA_URL
 from ..storage import db, vectors
 from ..indexer.runner import index_project
 from ..indexer.watcher import manager as watcher
@@ -31,7 +32,21 @@ def status():
     db.init_db()
     s = db.get_status()
     s["summary"] = db.summary_counts()
+    s["model"] = MODEL
+    s["num_ctx"] = NUM_CTX
     return s
+
+
+@app.get("/api/models")
+def models():
+    """Doc model that tu Ollama (/api/tags) - khong hard-code."""
+    try:
+        import ollama
+        data = ollama.Client(host=OLLAMA_URL).list()
+        names = [m.get("model") or m.get("name") for m in data.get("models", [])]
+        return {"current": MODEL, "models": [n for n in names if n], "ollama_ok": True}
+    except Exception as e:
+        return {"current": MODEL, "models": [], "ollama_ok": False, "error": str(e)}
 
 
 @app.post("/api/summarize")
@@ -111,7 +126,8 @@ def reset():
 
 @app.post("/api/clear")
 def clear_index():
-    """Xoa toan bo index (SQLite + ChromaDB) -> tra lai dung luong."""
+    """Xoa toan bo index (SQLite + ChromaDB). Dung watcher truoc de tranh race."""
+    watcher.stop()
     db.init_db()
     db.clear_all()
     vectors.clear_all()
@@ -125,10 +141,13 @@ app.mount("/", StaticFiles(directory=str(WEB_DIR), html=True), name="web")
 def main():
     import uvicorn
     db.init_db()
-    # Neu da tung index project -> bat watcher tu dong
+    # Neu da tung index project va path con ton tai -> bat watcher (tranh crash startup)
     root = db.get_status().get("project_root")
-    if root:
-        watcher.start(root)
+    if root and os.path.isdir(root):
+        try:
+            watcher.start(root)
+        except Exception as e:
+            print(f"[warn] khong bat duoc watcher: {e}")
     print(f"code-memory chay tai http://{HOST}:{PORT}")
     uvicorn.run(app, host=HOST, port=PORT)
 

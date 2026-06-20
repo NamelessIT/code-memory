@@ -1,15 +1,15 @@
 """
 Parse file ma nguon bang tree-sitter.
-Tra ve: symbols, imports, edges (call graph), routes (API).
-Ho tro: JavaScript/TypeScript/TSX, C#.
-Duyet de quy AST (ben hon query khi grammar doi phien ban).
+Tra ve: symbols (kem doc + body evidence), imports, edges (call graph), routes.
+Ho tro: Python, JavaScript/TypeScript/TSX, C#.
 """
 from functools import lru_cache
 
 from tree_sitter_language_pack import get_parser
+from ..config import MAX_BODY_CHARS
 
-# Loai node = "dinh nghia" can trich, map -> kind
 DEF_KINDS = {
+    # JS / TS
     "function_declaration": "function",
     "generator_function_declaration": "function",
     "method_definition": "method",
@@ -18,6 +18,7 @@ DEF_KINDS = {
     "interface_declaration": "interface",
     "type_alias_declaration": "type",
     "enum_declaration": "enum",
+    # C#
     "method_declaration": "method",
     "constructor_declaration": "constructor",
     "destructor_declaration": "destructor",
@@ -26,25 +27,35 @@ DEF_KINDS = {
     "record_declaration": "record",
     "namespace_declaration": "namespace",
     "delegate_declaration": "delegate",
+    # Python
+    "function_definition": "function",   # -> "method" neu nam trong class
+    "class_definition": "class",
 }
 
 CONTAINER_TYPES = {
     "class_declaration", "abstract_class_declaration", "interface_declaration",
     "struct_declaration", "record_declaration", "enum_declaration",
-    "namespace_declaration",
+    "namespace_declaration", "class_definition",
 }
 
-# Node co than chua loi goi -> dung lam "caller" khi ghi call edge
 CALLABLE_TYPES = {
     "function_declaration", "generator_function_declaration", "method_definition",
     "method_declaration", "constructor_declaration", "destructor_declaration",
+    "function_definition",
 }
 
 VAR_DECL_TYPES = {"lexical_declaration", "variable_declaration"}
 FUNC_VALUE_TYPES = {"arrow_function", "function", "function_expression"}
-CALL_TYPES = {"call_expression", "invocation_expression"}
+CALL_TYPES = {"call_expression", "invocation_expression", "call"}
+IMPORT_TYPES = {"import_statement", "import_from_statement", "using_directive", "import_declaration"}
 
 HTTP_METHODS = {"get", "post", "put", "delete", "patch", "head", "options", "all", "use"}
+
+# Ten thu muc (segment) goi y FE/BE - so khop CHINH XAC tung segment, khong substring.
+FE_SEGMENTS = {"components", "component", "pages", "page", "views", "view", "ui", "hooks", "widgets"}
+BE_SEGMENTS = {"controllers", "controller", "services", "service", "repositories", "repository",
+               "api", "server", "routes", "route", "models", "model", "dao", "middleware",
+               "handlers", "usecase", "usecases"}
 
 
 @lru_cache(maxsize=8)
@@ -57,32 +68,30 @@ def _text(node, src: bytes) -> str:
 
 
 def _first_line(text: str) -> str:
-    line = text.strip().splitlines()[0] if text.strip() else ""
-    return line[:300]
+    return (text.strip().splitlines()[0] if text.strip() else "")[:300]
 
 
-def _name_of(node, src: bytes):
+def _name_of(node, src):
     n = node.child_by_field_name("name")
     return _text(n, src) if n is not None else None
 
 
-def _callee_name(fn_node, src: bytes):
-    """Lay ten ham bi goi tu node 'function' cua call/invocation."""
+def _callee_name(fn_node, src):
     if fn_node is None:
         return None
     t = fn_node.type
     if t == "identifier":
         return _text(fn_node, src)
-    # JS: a.b()  -> property; C#: a.B() -> name
     if t in ("member_expression", "member_access_expression"):
         prop = fn_node.child_by_field_name("property") or fn_node.child_by_field_name("name")
-        if prop is not None:
-            return _text(prop, src)
+        return _text(prop, src) if prop is not None else None
+    if t == "attribute":  # Python a.b()
+        attr = fn_node.child_by_field_name("attribute")
+        return _text(attr, src) if attr is not None else None
     return None
 
 
-def _string_arg(call_node, src: bytes):
-    """Lay string literal dau tien trong arguments (vd path cua route)."""
+def _string_arg(call_node, src):
     args = call_node.child_by_field_name("arguments")
     if args is None:
         return None
@@ -92,49 +101,84 @@ def _string_arg(call_node, src: bytes):
     return None
 
 
-def _compute_tag(file_path: str, lang: str, kind: str, name: str) -> str:
-    """Heuristic gan nhan fe/be/event."""
-    p = file_path.lower().replace("\\", "/")
-    nm = (name or "").lower()
+def _python_docstring(node, src):
+    body = node.child_by_field_name("body")
+    if body is None:
+        return ""
+    for ch in body.children:
+        # Docstring co the la 'string' truc tiep hoac boc trong expression_statement
+        if ch.type == "string":
+            return _text(ch, src).strip().strip('"\'').strip()[:400]
+        if ch.type == "expression_statement" and ch.child_count and ch.children[0].type == "string":
+            return _text(ch.children[0], src).strip().strip('"\'').strip()[:400]
+        if ch.type not in ("comment",):
+            break
+    return ""
 
+
+def _leading_comment(node, src):
+    out = []
+    p = node.prev_sibling
+    while p is not None and p.type in ("comment",):
+        out.append(_text(p, src))
+        p = p.prev_sibling
+    return "\n".join(reversed(out))[:400]
+
+
+def _doc_for(node, src, lang):
+    return _python_docstring(node, src) if lang == "python" else _leading_comment(node, src)
+
+
+def _body_evidence(node, src):
+    """Than ham/class (cat gioi han) lam evidence de giai thich chuc nang."""
+    return _text(node, src)[:MAX_BODY_CHARS]
+
+
+def _compute_tag(rel_path, lang, kind, name):
+    p = rel_path.replace("\\", "/").lower()
+    segs = set(p.split("/"))
+    nm = (name or "").lower()
     if nm.startswith(("on", "handle")) or kind in ("event", "delegate"):
         return "event"
-
-    fe_hint = any(s in p for s in ("/component", "/pages", "/views", "/ui", "/hooks", "/src/app"))
-    be_hint = any(s in p for s in ("/controller", "/service", "/repositor", "/api",
-                                   "/server", "/route", "/model", "/dao", "/middleware"))
     if lang in ("javascript", "typescript", "tsx"):
-        if p.endswith((".tsx", ".jsx")) or fe_hint or nm.startswith("use"):
+        if p.endswith((".tsx", ".jsx")) or (segs & FE_SEGMENTS) or nm.startswith("use"):
             return "fe"
-        if be_hint:
+        if segs & BE_SEGMENTS:
             return "be"
         return ""
     if lang == "csharp":
         return "be"
+    if lang == "python":
+        if segs & BE_SEGMENTS:
+            return "be"
+        return ""
     return ""
 
 
-def parse_file(content: str, lang: str, file_path: str = ""):
-    """
-    Tra ve dict: {symbols, imports, edges, routes}.
-    - symbols: {kind,name,signature,start_line,end_line,parent,exported,tag}
-    - edges:   {caller, callee} (call graph trong file)
-    - routes:  {method, path, handler, line}
-    """
+def parse_file(content: str, lang: str, rel_path: str = ""):
     src = content.encode("utf-8")
     tree = _parser(lang).parse(src)
-
     symbols, imports, edges, routes = [], [], [], []
+
+    def add_symbol(node, kind, name, parent):
+        symbols.append({
+            "kind": kind, "name": name,
+            "signature": _first_line(_text(node, src)),
+            "doc": _doc_for(node, src, lang),
+            "body": _body_evidence(node, src),
+            "start_line": node.start_point[0] + 1,
+            "end_line": node.end_point[0] + 1,
+            "parent": parent, "exported": _is_exported(node),
+            "tag": _compute_tag(rel_path, lang, kind, name),
+        })
 
     def visit(node, parent_name, caller_name):
         ntype = node.type
-        child_parent = parent_name
-        child_caller = caller_name
+        child_parent, child_caller = parent_name, caller_name
 
-        if ntype in ("import_statement", "using_directive", "import_declaration"):
+        if ntype in IMPORT_TYPES:
             imports.append(_first_line(_text(node, src)))
 
-        # Arrow function gan vao bien: const foo = () => {...}
         if ntype in VAR_DECL_TYPES:
             for decl in node.children:
                 if decl.type == "variable_declarator":
@@ -143,15 +187,7 @@ def parse_file(content: str, lang: str, file_path: str = ""):
                         nn = decl.child_by_field_name("name")
                         if nn is not None:
                             fname = _text(nn, src)
-                            symbols.append({
-                                "kind": "function", "name": fname,
-                                "signature": _first_line(_text(decl, src)),
-                                "start_line": decl.start_point[0] + 1,
-                                "end_line": decl.end_point[0] + 1,
-                                "parent": parent_name, "exported": _is_exported(node),
-                                "tag": _compute_tag(file_path, lang, "function", fname),
-                            })
-                            # Duyet than arrow voi caller = fname
+                            add_symbol(decl, "function", fname, parent_name)
                             for c in decl.children:
                                 visit(c, parent_name, fname)
                             return
@@ -159,38 +195,28 @@ def parse_file(content: str, lang: str, file_path: str = ""):
         if ntype in DEF_KINDS:
             name = _name_of(node, src)
             if name:
-                symbols.append({
-                    "kind": DEF_KINDS[ntype], "name": name,
-                    "signature": _first_line(_text(node, src)),
-                    "start_line": node.start_point[0] + 1,
-                    "end_line": node.end_point[0] + 1,
-                    "parent": parent_name, "exported": _is_exported(node),
-                    "tag": _compute_tag(file_path, lang, DEF_KINDS[ntype], name),
-                })
+                kind = DEF_KINDS[ntype]
+                if ntype == "function_definition" and parent_name:  # Python method
+                    kind = "method"
+                add_symbol(node, kind, name, parent_name)
                 if ntype in CONTAINER_TYPES:
                     child_parent = name
                 if ntype in CALLABLE_TYPES:
                     child_caller = name
-                # C#: route tu attribute [HttpGet("...")] gan tren method
                 if ntype == "method_declaration":
                     _extract_cs_routes(node, src, name, routes)
 
-        # Call edge + route Express
         if ntype in CALL_TYPES:
             fn = node.child_by_field_name("function")
             callee = _callee_name(fn, src)
             if callee:
                 if caller_name:
                     edges.append({"caller": caller_name, "callee": callee})
-                # Express: app.get('/x', ...) / router.post(...)
-                if (fn is not None and fn.type == "member_expression"
-                        and callee in HTTP_METHODS):
+                if (fn is not None and fn.type == "member_expression" and callee in HTTP_METHODS):
                     path = _string_arg(node, src)
                     if path and path.startswith("/"):
-                        routes.append({
-                            "method": callee.upper(), "path": path,
-                            "handler": caller_name or "", "line": node.start_point[0] + 1,
-                        })
+                        routes.append({"method": callee.upper(), "path": path,
+                                       "handler": caller_name or "", "line": node.start_point[0] + 1})
 
         for child in node.children:
             visit(child, child_parent, child_caller)
@@ -200,24 +226,21 @@ def parse_file(content: str, lang: str, file_path: str = ""):
 
 
 def _extract_cs_routes(method_node, src, method_name, routes):
-    """C#: tim attribute [HttpGet(\"...\")] / [Route(\"...\")] tren method."""
     for ch in method_node.children:
         if ch.type != "attribute_list":
             continue
         for attr in ch.children:
             if attr.type != "attribute":
                 continue
-            aname_node = attr.child_by_field_name("name")
-            aname = _text(aname_node, src) if aname_node is not None else ""
+            an = attr.child_by_field_name("name")
+            aname = _text(an, src) if an is not None else ""
             if aname.startswith("Http"):
-                method = aname[4:].upper() or "GET"
-                path = _attr_string(attr, src) or ""
-                routes.append({"method": method, "path": path,
+                routes.append({"method": (aname[4:].upper() or "GET"),
+                               "path": _attr_string(attr, src) or "",
                                "handler": method_name, "line": method_node.start_point[0] + 1})
 
 
 def _attr_string(attr_node, src):
-    """Tim string literal bat ky trong attribute (de quy)."""
     stack = list(attr_node.children)
     while stack:
         n = stack.pop(0)
@@ -234,14 +257,14 @@ def _is_exported(node) -> bool:
     while p is not None:
         if p.type in ("export_statement", "export"):
             return True
-        if p.type in ("program", "source_file", "statement_block"):
+        if p.type in ("program", "source_file", "module", "statement_block"):
             break
         p = p.parent
     return False
 
 
-def build_skeleton(file_path: str, symbols, imports) -> str:
-    lines = [f"FILE: {file_path}"]
+def build_skeleton(rel_path, symbols, imports) -> str:
+    lines = [f"FILE: {rel_path}"]
     if imports:
         lines.append("IMPORTS:")
         for imp in imports[:25]:
@@ -250,5 +273,6 @@ def build_skeleton(file_path: str, symbols, imports) -> str:
     for s in symbols:
         tag = f" <{s['tag']}>" if s.get("tag") else ""
         parent = f" (in {s['parent']})" if s.get("parent") else ""
-        lines.append(f"  [{s['kind']}]{tag} {s['name']}{parent} :: {s['signature']}")
+        doc = f"  # {s['doc'].splitlines()[0]}" if s.get("doc") else ""
+        lines.append(f"  [{s['kind']}]{tag} {s['name']}{parent} :: {s['signature']}{doc}")
     return "\n".join(lines)

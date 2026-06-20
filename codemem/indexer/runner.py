@@ -1,4 +1,5 @@
 """Dieu phoi index: walker -> parser -> SQLite + ChromaDB. Index tang dan theo hash."""
+import os
 from pathlib import Path
 
 from .walker import walk_source_files, file_hash, read_text, detect_lang
@@ -40,8 +41,9 @@ def index_project(root: str, progress=None):
 
         try:
             content = read_text(path)
-            r = parse_file(content, lang, spath)
-            skeleton = build_skeleton(spath, r["symbols"], r["imports"])
+            rel = os.path.relpath(spath, root).replace("\\", "/")  # rel path: tag/skeleton chinh xac
+            r = parse_file(content, lang, rel)
+            skeleton = build_skeleton(rel, r["symbols"], r["imports"])
             db.upsert_file(spath, lang, h, skeleton, r["symbols"], r["edges"], r["routes"])
             vectors.index_file(spath, lang, skeleton, r["symbols"])
             if spath in existing:
@@ -78,8 +80,10 @@ def index_single_file(path: str):
         return False
     try:
         content = read_text(p)
-        r = parse_file(content, lang, str(p))
-        skeleton = build_skeleton(str(p), r["symbols"], r["imports"])
+        root = db.get_meta("project_root") or str(p.parent)
+        rel = os.path.relpath(str(p), root).replace("\\", "/")
+        r = parse_file(content, lang, rel)
+        skeleton = build_skeleton(rel, r["symbols"], r["imports"])
         h = file_hash(p)
         db.upsert_file(str(p), lang, h, skeleton, r["symbols"], r["edges"], r["routes"])
         vectors.index_file(str(p), lang, skeleton, r["symbols"])

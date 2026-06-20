@@ -34,7 +34,9 @@ async function loadStatus() {
   try {
     const s = await (await fetch("/api/status")).json();
     const proj = s.project_root ? ` · ${s.project_root}` : " · chưa index project";
-    $("status").textContent = `${s.files} file · ${s.symbols} symbol${proj}`;
+    const sm = s.summary ? ` · ${s.summary.summarized}/${s.summary.total} tóm tắt` : "";
+    $("status").textContent = `${s.files} file · ${s.symbols} symbol${sm}${proj}`;
+    if (s.model) $("modelBadge").textContent = `${s.model} · ${s.num_ctx || "?"}ctx`;
   } catch {
     $("status").textContent = "Không kết nối được server";
   }
@@ -65,7 +67,10 @@ async function showRoutes() {
   const res = await (await fetch("/api/routes")).json();
   const b = addMsg("assistant");
   if (!res.routes || !res.routes.length) { b.textContent = "Chưa tìm thấy route API nào (index project có Express/ASP.NET trước)."; return; }
-  const rows = res.routes.map(r => `${r.method.padEnd(6)} ${r.path}${r.handler ? "  → " + r.handler : ""}`).join("\n");
+  const rows = res.routes.map(r => {
+    const loc = r.file_path ? `  (${r.file_path.split(/[\\/]/).pop()}:${r.line || "?"})` : "";
+    return `${r.method.padEnd(6)} ${r.path}${r.handler ? "  → " + r.handler : ""}${loc}`;
+  }).join("\n");
   b.innerHTML = `<b>API endpoints (${res.routes.length}):</b><pre><code>${escapeHtml(rows)}</code></pre>`;
 }
 

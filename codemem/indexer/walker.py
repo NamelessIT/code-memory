@@ -26,8 +26,8 @@ def walk_source_files(root: str):
     """
     root_path = Path(root).resolve()
     for path in root_path.rglob("*"):
-        # Bo qua neu nam trong thu muc ignore (bat ky cap nao)
-        if any(part in IGNORE_DIRS for part in path.parts):
+        # Bo qua neu nam trong thu muc ignore (khong phan biet hoa/thuong)
+        if any(part.lower() in IGNORE_DIRS for part in path.parts):
             continue
         if not path.is_file():
             continue

@@ -66,12 +66,14 @@ def index_file(path, lang, skeleton, symbols):
     metas.append({"file_path": path, "lang": lang, "kind": "file", "name": path})
     ids.append(f"{path}::file")
 
-    # 1 doc moi symbol
+    # 1 doc moi symbol (kem doc/comment de semantic tot hon)
     for i, s in enumerate(symbols):
         text = f"{s['kind']} {s['name']}"
         if s.get("parent"):
             text += f" in {s['parent']}"
         text += f"\n{s['signature']}"
+        if s.get("doc"):
+            text += f"\n{s['doc']}"
         docs.append(text)
         metas.append({
             "file_path": path, "lang": lang, "kind": s["kind"],
@@ -101,7 +103,7 @@ def index_summary(path, lang, summary):
 
 
 def query(text, n=12):
-    """Semantic search -> list metadata (kem file_path, name, kind...)."""
+    """Semantic search -> list metadata (kem _distance de loc nguong)."""
     col = get_collection()
     if col is None:
         return []
@@ -109,8 +111,20 @@ def query(text, n=12):
         count = col.count()
         if count == 0:
             return []
-        res = col.query(query_texts=[text], n_results=min(n, count))
+        res = col.query(query_texts=[text], n_results=min(n, count),
+                        include=["metadatas", "distances"])
     except Exception:
         return []
-    metas = res.get("metadatas", [[]])[0]
-    return metas or []
+    metas = (res.get("metadatas") or [[]])[0] or []
+    dists = (res.get("distances") or [[]])[0] or []
+    out = []
+    for i, m in enumerate(metas):
+        m = dict(m)
+        m["_distance"] = dists[i] if i < len(dists) else None
+        out.append(m)
+    return out
+
+
+def available():
+    """True neu vector store (chromadb + embedding) dung duoc -> de bao degraded mode."""
+    return get_collection() is not None
