@@ -1,4 +1,5 @@
-"""Dieu phoi index: walker -> parser -> SQLite + ChromaDB. Index tang dan theo hash."""
+"""Dieu phoi index: walker -> parser -> SQLite + ChromaDB. Index tang dan theo hash.
+Vector la derived index: SQLite la source of truth, vector co the repair (reconcile)."""
 import os
 from pathlib import Path
 
@@ -7,49 +8,66 @@ from .parser import parse_file, build_skeleton
 from ..storage import db, vectors
 
 
-def index_project(root: str, progress=None):
-    """
-    Index toan bo project tai 'root'. Chi xu ly file moi/thay doi; xoa file da bien mat.
-    progress: callable(msg) tuy chon de bao tien do.
-    Tra ve thong ke.
-    """
-    db.init_db()
-    root = str(Path(root).resolve())
+def canonical_root(root: str) -> str:
+    """Chuan hoa root (Windows: drive/case/separator/symlink) de cung thu muc -> 1 project."""
+    return os.path.normcase(os.path.normpath(os.path.realpath(str(root))))
 
-    # Multi-project: lay/tao project, set active. KHONG wipe project khac.
+
+def _index_one(spath, lang, h, root, pid, progress=None):
+    """Parse + ghi SQLite + vector cho 1 file. Tra ve True neu vector ok."""
+    content = read_text(Path(spath))
+    rel = os.path.relpath(spath, root).replace("\\", "/")
+    r = parse_file(content, lang, rel)
+    skeleton = build_skeleton(rel, r["symbols"], r["imports"])
+    db.upsert_file(spath, lang, h, skeleton, r["symbols"], r["edges"], r["routes"], project_id=pid)
+    vec_ok = vectors.index_file(spath, lang, skeleton, r["symbols"], project_id=pid)
+    db.set_vector_ok(spath, vec_ok, pid)   # vector that bai -> danh dau de reconcile sau
+    if progress:
+        progress(f"indexed {spath} ({len(r['symbols'])} symbols, vector={'ok' if vec_ok else 'pending'})")
+    return vec_ok
+
+
+def reconcile_vectors(pid, progress=None):
+    """Repair vector cho file co trong SQLite nhung vector pending/thieu (#P0-5)."""
+    repaired = still_pending = 0
+    for f in db.files_pending_vector(pid):
+        syms = db.get_symbols_for_file(f["path"], project_id=pid)
+        ok = vectors.index_file(f["path"], f["lang"], f["skeleton"] or "", syms, project_id=pid)
+        db.set_vector_ok(f["path"], ok, pid)
+        if ok:
+            repaired += 1
+        else:
+            still_pending += 1
+    if progress and (repaired or still_pending):
+        progress(f"reconcile vector: repaired={repaired}, pending={still_pending}")
+    return {"repaired": repaired, "pending": still_pending}
+
+
+def index_project(root: str, progress=None):
+    """Index project tai 'root' (incremental). KHONG wipe project khac."""
+    db.init_db()
+    root = canonical_root(root)
     pid = db.get_or_create_project(root)
     db.set_active_project(pid)
 
-    existing = db.get_indexed_hashes(pid)    # {path: hash} cua RIENG project nay
+    existing = db.get_indexed_hashes(pid)
     seen = set()
-
     n_new = n_upd = n_skip = n_err = 0
 
     for path, lang in walk_source_files(root):
-        spath = str(path)
+        spath = os.path.normcase(str(path))   # khop voi root da normcase
         seen.add(spath)
         try:
             h = file_hash(path)
         except OSError:
             continue
-
         if existing.get(spath) == h:
             n_skip += 1
             continue
-
         try:
-            content = read_text(path)
-            rel = os.path.relpath(spath, root).replace("\\", "/")  # rel path: tag/skeleton chinh xac
-            r = parse_file(content, lang, rel)
-            skeleton = build_skeleton(rel, r["symbols"], r["imports"])
-            db.upsert_file(spath, lang, h, skeleton, r["symbols"], r["edges"], r["routes"], project_id=pid)
-            vectors.index_file(spath, lang, skeleton, r["symbols"], project_id=pid)
-            if spath in existing:
-                n_upd += 1
-            else:
-                n_new += 1
-            if progress:
-                progress(f"indexed {spath} ({len(r['symbols'])} symbols)")
+            _index_one(spath, lang, h, root, pid, progress)
+            n_upd += 1 if spath in existing else 0
+            n_new += 0 if spath in existing else 1
         except Exception as e:
             n_err += 1
             if progress:
@@ -59,39 +77,41 @@ def index_project(root: str, progress=None):
     removed = [p for p in existing if p not in seen]
     for p in removed:
         db.delete_file(p, project_id=pid)
-        vectors.delete_file(p)
+        vectors.delete_file(p, project_id=pid)
 
+    # Repair vector pending (ke ca file unchanged nhung vector tung loi)
+    rec = reconcile_vectors(pid, progress)
     db.touch_project(pid)
 
     return {
         "project_root": root, "project_id": pid,
         "new": n_new, "updated": n_upd, "skipped": n_skip,
         "removed": len(removed), "errors": n_err,
+        "vector_repaired": rec["repaired"], "vector_pending": rec["pending"],
     }
 
 
-def index_single_file(path: str):
-    """Index lai 1 file (dung cho watcher khi file thay doi)."""
+def index_single_file(path: str, project_id=None):
+    """Index lai 1 file (watcher). Bind project_id CO DINH (khong doc active toan cuc - #P0-6)."""
     p = Path(path)
     lang = detect_lang(p)
     if not lang or not p.is_file():
         return False
+    pid = project_id if project_id is not None else db.active_project_id()
+    if pid is None:
+        return False
+    root = db.get_project_root(pid) or str(p.parent)
     try:
-        pid = db.active_project_id()
-        root = db.get_active_root() or str(p.parent)
-        rel = os.path.relpath(str(p), root).replace("\\", "/")
-        content = read_text(p)
-        r = parse_file(content, lang, rel)
-        skeleton = build_skeleton(rel, r["symbols"], r["imports"])
         h = file_hash(p)
-        db.upsert_file(str(p), lang, h, skeleton, r["symbols"], r["edges"], r["routes"], project_id=pid)
-        vectors.index_file(str(p), lang, skeleton, r["symbols"], project_id=pid)
-        return True
-    except Exception:
+        return _index_one(os.path.normcase(str(p)), lang, h, root, pid)
+    except Exception as e:
+        print(f"[warn] index_single_file {path}: {e}")
         return False
 
 
-def remove_file(path: str):
-    """Go 1 file khoi index (file bi xoa)."""
-    db.delete_file(str(Path(path)))
-    vectors.delete_file(str(Path(path)))
+def remove_file(path: str, project_id=None):
+    """Go 1 file khoi index (file bi xoa). Bind project_id co dinh."""
+    pid = project_id if project_id is not None else db.active_project_id()
+    sp = os.path.normcase(str(Path(path)))
+    db.delete_file(sp, project_id=pid)
+    vectors.delete_file(sp, project_id=pid)

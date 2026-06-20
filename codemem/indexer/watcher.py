@@ -47,19 +47,24 @@ class _Handler(FileSystemEventHandler):
 
 
 class WatcherManager:
-    """Quan ly 1 observer; debounce cac thay doi roi index lai."""
+    """Quan ly 1 observer; debounce; BIND project_id + generation tai luc start (#P0-6)."""
     def __init__(self):
         self.observer = None
         self.root = None
-        self._pending = {}      # path -> deleted?
+        self.project_id = None
+        self.generation = 0          # tang moi lan start/stop -> phat hien timer/flush stale
+        self._pending = {}
         self._lock = threading.Lock()
         self._timer = None
 
-    def start(self, root: str):
+    def start(self, root: str, project_id=None):
         if not _HAS_WATCHDOG:
             return False
         self.stop()
-        self.root = str(Path(root).resolve())
+        with self._lock:
+            self.generation += 1
+            self.root = str(Path(root).resolve())
+            self.project_id = project_id
         self.observer = Observer()
         self.observer.schedule(_Handler(self), self.root, recursive=True)
         self.observer.daemon = True
@@ -67,12 +72,13 @@ class WatcherManager:
         return True
 
     def stop(self):
-        # Huy timer + clear pending de event project cu khong flush sau khi switch
         with self._lock:
+            self.generation += 1     # vo hieu hoa moi timer/flush dang cho
             if self._timer:
                 self._timer.cancel()
                 self._timer = None
             self._pending.clear()
+            self.project_id = None
         if self.observer:
             try:
                 self.observer.stop()
@@ -84,25 +90,30 @@ class WatcherManager:
 
     def schedule(self, path, deleted=False):
         with self._lock:
+            gen = self.generation
             self._pending[path] = deleted
             if self._timer:
                 self._timer.cancel()
-            self._timer = threading.Timer(1.5, self._flush)
+            self._timer = threading.Timer(1.5, self._flush, args=(gen,))
             self._timer.daemon = True
             self._timer.start()
 
-    def _flush(self):
+    def _flush(self, gen):
         with self._lock:
+            if gen != self.generation:   # da switch/stop -> bo, KHONG ghi vao project moi
+                self._pending.clear()
+                return
+            pid = self.project_id
             pending = dict(self._pending)
             self._pending.clear()
         for path, deleted in pending.items():
             try:
                 if deleted:
-                    remove_file(path)
+                    remove_file(path, project_id=pid)
                 else:
-                    index_single_file(path)
-            except Exception:
-                pass
+                    index_single_file(path, project_id=pid)
+            except Exception as e:
+                print(f"[warn] watcher flush {path}: {e}")
 
 
 manager = WatcherManager()

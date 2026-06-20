@@ -31,6 +31,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             project_id INTEGER, path TEXT,
             lang TEXT, hash TEXT, skeleton TEXT, indexed_at TEXT, summary TEXT DEFAULT '',
+            vector_ok INTEGER DEFAULT 1,
             UNIQUE(project_id, path)
         );
         CREATE TABLE IF NOT EXISTS symbols (
@@ -61,6 +62,7 @@ def init_db():
         "ALTER TABLE symbols ADD COLUMN doc TEXT DEFAULT ''",
         "ALTER TABLE symbols ADD COLUMN body TEXT DEFAULT ''",
         "ALTER TABLE files ADD COLUMN summary TEXT DEFAULT ''",
+        "ALTER TABLE files ADD COLUMN vector_ok INTEGER DEFAULT 1",
         "ALTER TABLE files ADD COLUMN project_id INTEGER",
         "ALTER TABLE symbols ADD COLUMN project_id INTEGER",
         "ALTER TABLE edges ADD COLUMN project_id INTEGER",
@@ -79,6 +81,7 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 project_id INTEGER, path TEXT,
                 lang TEXT, hash TEXT, skeleton TEXT, indexed_at TEXT, summary TEXT DEFAULT '',
+                vector_ok INTEGER DEFAULT 1,
                 UNIQUE(project_id, path)
             );
             INSERT INTO files_new(project_id, path, lang, hash, skeleton, indexed_at, summary)
@@ -277,6 +280,31 @@ def get_symbols_for_file(path, project_id=None):
     return [dict(r) for r in rows]
 
 
+def set_vector_ok(path, ok, project_id):
+    conn = _conn()
+    conn.execute("UPDATE files SET vector_ok=? WHERE project_id=? AND path=?",
+                 (1 if ok else 0, project_id, path))
+    conn.commit()
+    conn.close()
+
+
+def files_pending_vector(project_id):
+    """File co trong SQLite nhung vector chua thanh cong -> can repair (#P0-5)."""
+    conn = _conn()
+    rows = conn.execute(
+        "SELECT path, lang, skeleton FROM files WHERE project_id=? AND COALESCE(vector_ok,1)=0",
+        (project_id,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_project_root(pid):
+    conn = _conn()
+    row = conn.execute("SELECT root FROM projects WHERE id=?", (pid,)).fetchone()
+    conn.close()
+    return row["root"] if row else None
+
+
 def search_symbols(keyword, limit=20, project_id=None):
     conn = _conn()
     pid = project_id if project_id is not None else _active_pid(conn)
@@ -342,10 +370,13 @@ def get_status(project_id=None):
         "SELECT lang, COUNT(*) c FROM files WHERE project_id=? GROUP BY lang", (pid,)).fetchall()}
     by_kind = {r["kind"]: r["c"] for r in conn.execute(
         "SELECT kind, COUNT(*) c FROM symbols WHERE project_id=? GROUP BY kind", (pid,)).fetchall()}
+    pending = conn.execute("SELECT COUNT(*) c FROM files WHERE project_id=? AND COALESCE(vector_ok,1)=0",
+                           (pid,)).fetchone()["c"]
     prow = conn.execute("SELECT root FROM projects WHERE id=?", (pid,)).fetchone() if pid else None
     conn.close()
     return {"files": nf, "symbols": ns, "by_language": by_lang, "by_kind": by_kind,
-            "project_root": prow["root"] if prow else None, "project_id": pid}
+            "project_root": prow["root"] if prow else None, "project_id": pid,
+            "vector_pending": pending}
 
 
 def get_structure(limit=400, project_id=None):

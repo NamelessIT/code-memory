@@ -82,7 +82,7 @@ def project_select(body: ProjectBody):
     p = db.get_active_project()
     if p and os.path.isdir(p["root"]):
         try:
-            watcher.start(p["root"])
+            watcher.start(p["root"], project_id=p["id"])
         except Exception as e:
             print(f"[warn] watcher: {e}")
     return {"ok": True, "active": p}
@@ -98,15 +98,16 @@ def project_delete(body: ProjectBody):
         watcher.stop()
         session.history.clear()
     db.delete_project(body.id)              # tu chon active ke tiep neu xoa active
-    vectors.delete_project(body.id)
+    vec_ok = vectors.delete_project(body.id)
     # Neu con project active moi -> bat lai watcher
     p = db.get_active_project()
     if p and os.path.isdir(p["root"]):
         try:
-            watcher.start(p["root"])
+            watcher.start(p["root"], project_id=p["id"])
         except Exception:
             pass
-    return {"ok": True, "active": p}
+    # Partial result: SQLite da xoa; bao ro vector co xoa duoc khong (#P0-10)
+    return {"ok": True, "vector_deleted": vec_ok, "active": p}
 
 
 @app.post("/api/summarize")
@@ -134,7 +135,7 @@ def do_index(body: IndexBody):
     watcher.stop()                        # dung watcher project cu truoc khi doi active (chong race)
     stats = index_project(body.path)
     try:
-        watcher.start(stats["project_root"])
+        watcher.start(stats["project_root"], project_id=stats["project_id"])
     except Exception as e:
         print(f"[warn] watcher: {e}")
     return stats
@@ -193,12 +194,13 @@ def reset():
 
 @app.post("/api/clear")
 def clear_index():
-    """Xoa toan bo index (SQLite + ChromaDB). Dung watcher truoc de tranh race."""
+    """Xoa toan bo index (SQLite + ChromaDB). Dung watcher + reset chat (#P0-10)."""
     watcher.stop()
     db.init_db()
     db.clear_all()
-    vectors.clear_all()
-    return {"ok": True}
+    vec_ok = vectors.clear_all()           # partial result: bao ro vector co xoa duoc khong
+    session.history.clear()                # evidence da mat -> khong giu chat cu
+    return {"ok": True, "sqlite_cleared": True, "vector_cleared": vec_ok}
 
 
 # Phuc vu Web UI (mount cuoi cung de khong de len API routes)
@@ -209,10 +211,10 @@ def main():
     import uvicorn
     db.init_db()
     # Neu da tung index project va path con ton tai -> bat watcher (tranh crash startup)
-    root = db.get_status().get("project_root")
-    if root and os.path.isdir(root):
+    p = db.get_active_project()
+    if p and os.path.isdir(p["root"]):
         try:
-            watcher.start(root)
+            watcher.start(p["root"], project_id=p["id"])
         except Exception as e:
             print(f"[warn] khong bat duoc watcher: {e}")
     print(f"code-memory chay tai http://{HOST}:{PORT}")

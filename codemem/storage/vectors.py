@@ -55,24 +55,33 @@ def available():
     return _raw() is not None
 
 
-def delete_file(path):
+def delete_file(path, project_id=None):
+    """Xoa vector cua 1 file. Neu co project_id -> CHI xoa trong project do
+    (tranh xoa nham embeddings cung absolute path cua project khac - #P0-8)."""
     col = _raw()
     if col is None:
-        return
+        return True            # khong co vector store -> coi nhu khong con gi de xoa
     try:
-        col.delete(where={"file_path": path})
+        if project_id is not None:
+            col.delete(where={"$and": [{"file_path": path}, {"project_id": project_id}]})
+        else:
+            col.delete(where={"file_path": path})
+        return True
     except Exception as e:
         print(f"[warn] vector delete_file loi: {e}")
+        return False
 
 
 def delete_project(project_id):
     col = _raw()
     if col is None:
-        return
+        return True
     try:
         col.delete(where={"project_id": project_id})
+        return True
     except Exception as e:
         print(f"[warn] vector delete_project loi: {e}")
+        return False
 
 
 def clear_all():
@@ -87,19 +96,21 @@ def clear_all():
             client.delete_collection(CHROMA_COLLECTION)
         except Exception:
             pass
+        _collection = None
+        _raw_col = None
+        _embed_failed = False     # reset de thu lai
+        _raw_failed = False
+        return True
     except Exception as e:
         print(f"[warn] vector clear_all loi: {e}")
-    _collection = None
-    _raw_col = None
-    _embed_failed = False     # reset de thu lai
-    _raw_failed = False
+        return False
 
 
 def index_file(path, lang, skeleton, symbols, project_id=None):
     col = get_collection()
     if col is None:
         return False                       # lexical mode: bo qua vector (van index SQLite)
-    delete_file(path)
+    delete_file(path, project_id=project_id)   # chi xoa vector cu cua dung project nay
     docs, metas, ids = [], [], []
     base = {"file_path": path, "lang": lang, "project_id": project_id}
     docs.append(skeleton)
