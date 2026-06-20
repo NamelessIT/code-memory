@@ -48,7 +48,12 @@ header {
   max-width: 60%; overflow: hidden; text-overflow: ellipsis;
 }
 
-.bar-tools { display: flex; gap: 8px; margin-top: 10px; }
+.bar-tools { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+#projectSelect {
+  padding: 8px 10px; background: var(--code); color: var(--text);
+  border: 1px solid var(--border); border-radius: var(--radius); max-width: 220px;
+}
+#delProjectBtn { padding: 8px 12px; }
 .bar-tools input {
   flex: 1;
   padding: 9px 13px;

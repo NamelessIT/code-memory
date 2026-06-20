@@ -2,7 +2,14 @@
 import codemem.retrieval.search as search
 
 
+def _common(monkeypatch):
+    monkeypatch.setattr(search.db, "active_project_id", lambda: 1)
+    monkeypatch.setattr(search.db, "get_overview", lambda *a, **k: "")
+    monkeypatch.setattr(search.db, "get_active_root", lambda: "/p")
+
+
 def test_insufficient_evidence(monkeypatch):
+    _common(monkeypatch)
     monkeypatch.setattr(search.vectors, "query", lambda *a, **k: [])
     monkeypatch.setattr(search.db, "search_symbols", lambda *a, **k: [])
     text, sources = search.build_context("bat ky cau hoi nao")
@@ -10,7 +17,7 @@ def test_insufficient_evidence(monkeypatch):
 
 
 def test_semantic_distance_threshold(monkeypatch):
-    # candidate qua xa (distance lon) + khong co lexical -> coi nhu khong du chung cu
+    _common(monkeypatch)
     far = [{"file_path": "/p/a.py", "name": "foo", "kind": "function",
             "start_line": 1, "_distance": 5.0}]
     monkeypatch.setattr(search.vectors, "query", lambda *a, **k: far)
@@ -20,6 +27,7 @@ def test_semantic_distance_threshold(monkeypatch):
 
 
 def test_context_built_when_relevant(monkeypatch):
+    _common(monkeypatch)
     near = [{"file_path": "/p/a.py", "name": "foo", "kind": "function",
              "start_line": 3, "_distance": 0.2}]
     monkeypatch.setattr(search.vectors, "query", lambda *a, **k: near)

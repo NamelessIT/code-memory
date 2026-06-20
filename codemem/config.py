@@ -10,7 +10,7 @@ CHROMA_DIR = DATA_DIR / "vector_index"
 WEB_DIR = ROOT_DIR / "web"
 
 # Phien ban schema/parser/prompt -> doi thi invalidate du lieu phai sinh lai
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"   # 3: multi-project (projects table + project_id)
 SUMMARY_PROMPT_VERSION = "2"
 
 # --- Server ---

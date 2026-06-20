@@ -59,7 +59,7 @@ def build_overview():
     body = "\n".join(f"- {os.path.basename(s['path'])}: {s['summary']}" for s in sums)[:8000]
     ov = _ask(_OVERVIEW_SYS, f"Tóm tắt các file:\n{body}", max_ctx=NUM_CTX)
     if ov:
-        db.set_meta("overview", ov)
+        db.set_overview(ov)
     return ov or ""
 
 
@@ -70,13 +70,14 @@ def run_summarize(make_overview=True):
             return
         progress = {"running": True, "done": 0, "total": 0, "errors": 0, "phase": "summarizing"}
     try:
+        pid = db.active_project_id()
         files = db.files_needing_summary()
         progress["total"] = len(files)
         for f in files:
             summ = summarize_file(f["skeleton"] or "")
             if summ:                       # chi luu summary hop le
                 db.set_file_summary(f["path"], summ)
-                vectors.index_summary(f["path"], f["lang"], summ)
+                vectors.index_summary(f["path"], f["lang"], summ, project_id=pid)
             else:
                 progress["errors"] += 1
             progress["done"] += 1

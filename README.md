@@ -63,7 +63,8 @@ web/           giao diện chat
 
 ## Tính năng
 
-- Index JS/TS/TSX/C# (tree-sitter, tăng dần theo hash)
+- **Multi-project**: nhớ nhiều codebase độc lập; dropdown chọn/xoá project; đổi project không xoá project khác
+- Index **Python** + JS/TS/TSX/C# (tree-sitter, tăng dần theo hash)
 - Hỏi đáp RAG: ghép **ngữ cảnh codebase** + **brain 14k bài học** vào câu trả lời
 - **Call graph**: ai gọi ai (nút liên quan trong câu trả lời, API `/api/related/{name}`)
 - **Route API**: tự trích endpoint Express / ASP.NET (nút **Routes**, API `/api/routes`)

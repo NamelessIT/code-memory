@@ -27,6 +27,10 @@ class ChatBody(BaseModel):
     message: str
 
 
+class ProjectBody(BaseModel):
+    id: int
+
+
 @app.get("/api/status")
 def status():
     db.init_db()
@@ -47,6 +51,39 @@ def models():
         return {"current": MODEL, "models": [n for n in names if n], "ollama_ok": True}
     except Exception as e:
         return {"current": MODEL, "models": [], "ollama_ok": False, "error": str(e)}
+
+
+@app.get("/api/projects")
+def projects():
+    db.init_db()
+    return {"projects": db.list_projects()}
+
+
+@app.post("/api/project/select")
+def project_select(body: ProjectBody):
+    """Doi project active: KHONG wipe; reset chat; chuyen watcher sang project moi."""
+    db.set_active_project(body.id)
+    session.history.clear()                 # khong mang history sang project khac
+    p = db.get_active_project()
+    watcher.stop()
+    if p and os.path.isdir(p["root"]):
+        try:
+            watcher.start(p["root"])
+        except Exception:
+            pass
+    return {"ok": True, "active": p}
+
+
+@app.post("/api/project/delete")
+def project_delete(body: ProjectBody):
+    """Xoa 1 project (SQLite + vector) - KHONG dung den project khac."""
+    active = db.active_project_id()
+    db.delete_project(body.id)
+    vectors.delete_project(body.id)
+    if active == body.id:
+        watcher.stop()
+        session.history.clear()
+    return {"ok": True}
 
 
 @app.post("/api/summarize")

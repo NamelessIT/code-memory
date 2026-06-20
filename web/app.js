@@ -42,6 +42,43 @@ async function loadStatus() {
   }
 }
 
+async function loadProjects() {
+  try {
+    const { projects } = await (await fetch("/api/projects")).json();
+    const sel = $("projectSelect");
+    if (!projects.length) {
+      sel.innerHTML = '<option value="">(chưa có project)</option>';
+      return;
+    }
+    sel.innerHTML = projects.map(p =>
+      `<option value="${p.id}" ${p.active ? "selected" : ""}>${escapeHtml(p.name)} (${p.files})</option>`
+    ).join("");
+  } catch {}
+}
+
+async function selectProject(id) {
+  if (!id) return;
+  await fetch("/api/project/select", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id: Number(id) }),
+  });
+  chat.innerHTML = "";
+  loadStatus();
+  addMsg("assistant").textContent = "🔀 Đã chuyển project. Lịch sử chat đã reset.";
+}
+
+async function deleteProject() {
+  const sel = $("projectSelect");
+  const id = sel.value, name = sel.options[sel.selectedIndex]?.text || "";
+  if (!id) return;
+  if (!confirm(`Xoá project "${name}" khỏi bộ nhớ? (không xoá file gốc, không ảnh hưởng project khác)`)) return;
+  await fetch("/api/project/delete", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id: Number(id) }),
+  });
+  await loadProjects(); loadStatus();
+}
+
 async function indexProject() {
   const path = $("projectPath").value.trim();
   if (!path) { alert("Nhập đường dẫn project trước."); return; }
@@ -60,6 +97,7 @@ async function indexProject() {
     $("indexBtn").disabled = false;
     $("indexBtn").textContent = "Index";
     loadStatus();
+    loadProjects();
   }
 }
 
@@ -178,7 +216,10 @@ $("input").addEventListener("input", function () {
   this.style.height = "auto";
   this.style.height = Math.min(this.scrollHeight, 170) + "px";
 });
+$("projectSelect").addEventListener("change", (e) => selectProject(e.target.value));
+$("delProjectBtn").onclick = deleteProject;
 document.querySelectorAll(".chip").forEach(c =>
   c.addEventListener("click", () => send(c.dataset.q)));
 
 loadStatus();
+loadProjects();

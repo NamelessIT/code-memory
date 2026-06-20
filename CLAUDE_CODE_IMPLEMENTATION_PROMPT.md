@@ -261,3 +261,37 @@ Lệnh: `python -m pytest tests -q` → **15 passed**.
 
 ## 9.7 File đã đổi
 `codemem/config.py`, `codemem/indexer/{walker,parser,runner,summarizer}.py`, `codemem/storage/{db,vectors}.py`, `codemem/retrieval/search.py`, `codemem/chat/agent.py`, `codemem/api/server.py`, `web/{app.js,index.html}`; thêm `tests/{test_parser,test_tagging,test_retrieval,test_summarizer}.py`; `requirements.txt` (pytest).
+
+---
+
+# 10. CẬP NHẬT (lượt 2) — MULTI-PROJECT SCHEMA (XONG ✅)
+
+Đã hoàn thành item P0 đầu bảng còn thiếu ở 9.6: **bộ nhớ nhiều codebase độc lập** (acceptance "giữ và tìm kiếm ≥2 project sau restart").
+
+## 10.1 Thay đổi
+- **Schema**: thêm bảng `projects` (id, root UNIQUE, name, created/last_indexed); thêm cột `project_id` cho `files/symbols/edges/routes`. Project active lưu ở `meta.active_project_id`. Overview lưu **per-project** (`meta.overview:{pid}`). `SCHEMA_VERSION=3`.
+- **Migration tự động**: DB single-project cũ → tạo 1 project từ `meta.project_root`, gán `project_id` cho toàn bộ dữ liệu cũ, set active. KHÔNG mất dữ liệu.
+- **Không wipe khi đổi project nữa**: `runner.index_project` dùng `get_or_create_project` + `set_active_project`, index theo `project_id`; `get_indexed_hashes(pid)` incremental trong từng project.
+- **Mọi query scope theo project active** (mặc định) hoặc `project_id` truyền vào: `search_symbols/get_symbols_by_name/symbol_exists/get_callees/get_callers/get_routes/get_status/get_structure/files_needing_summary/all_file_summaries/summary_counts`.
+- **Vector store scope**: `index_file/index_summary` gắn `project_id` vào metadata; `query(..., project_id)` lọc `where={project_id}`; `delete_project(pid)` xoá vector của riêng project.
+- **API mới**: `GET /api/projects` (list + active + số file), `POST /api/project/select {id}` (đổi active, **reset chat**, chuyển watcher), `POST /api/project/delete {id}` (xoá 1 project, không đụng project khác).
+- **UI**: dropdown chọn project + nút xoá project (🗑) ở thanh công cụ; đổi project → reset khung chat; index xong tự refresh danh sách.
+- **Lifecycle**: đổi/xoá project active → dừng watcher + clear chat session (không mang context project cũ sang project mới).
+
+## 10.2 Tests + kết quả
+`python -m pytest tests -q` → **17 passed** (thêm `tests/test_projects.py`: isolation + indexed-hashes scoped, dùng DB tạm `monkeypatch DB_PATH`).
+
+Integration test thật:
+- Index 2 project (repo code-memory 23 file + temp 1 file) → cùng tồn tại.
+- Active B: thấy `create_order`, KHÔNG thấy `index_project`. Active A: thấy `index_project`, KHÔNG thấy `create_order` → **isolation đúng**.
+- Xoá B → A nguyên vẹn (23 file/151 symbol).
+- `/api/projects` + `/api/status` scope đúng project active; `compileall` + `node --check` pass; server 23 routes.
+
+## 10.3 TODO còn lại (ưu tiên giảm dần)
+1. Background jobs (index/summarize có job ID/progress/cancel/retry) — hiện index blocking, summarize thread đơn.
+2. Lexical FTS5/BM25 thật + token-accurate budget (hiện token-LIKE + char-approx).
+3. Security: CSRF/Origin/Host + session nonce; path allowlist/canonicalize/symlink; disable `/docs`.
+4. UI overhaul sâu: tabs (Explorer/Workflows/Issues), responsive `100dvh`+a11y, SSE robust+AbortController, sources click mở snippet.
+5. Frameworks routes (FastAPI/Flask/Django/Nest/Next), graph qualified-ID/provenance, import/inheritance/event graph.
+6. Vector reconciliation job (thiếu/thừa/stale) + retry khi DB ok nhưng Chroma fail.
+7. Chunk thêm README/JSON/YAML/SQL; `.gitignore` parsing; overview post-validation bằng code; chat session theo session/project ID (hiện vẫn singleton, đã reset khi switch).

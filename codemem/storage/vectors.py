@@ -52,21 +52,30 @@ def delete_file(path):
         pass
 
 
-def index_file(path, lang, skeleton, symbols):
-    """Them skeleton + tung symbol cua file vao vector index."""
+def delete_project(project_id):
+    col = get_collection()
+    if col is None:
+        return
+    try:
+        col.delete(where={"project_id": project_id})
+    except Exception:
+        pass
+
+
+def index_file(path, lang, skeleton, symbols, project_id=None):
+    """Them skeleton + tung symbol cua file vao vector index (gan project_id)."""
     col = get_collection()
     if col is None:
         return
     delete_file(path)
 
     docs, metas, ids = [], [], []
+    base = {"file_path": path, "lang": lang, "project_id": project_id}
 
-    # 1 doc cho skeleton ca file
     docs.append(skeleton)
-    metas.append({"file_path": path, "lang": lang, "kind": "file", "name": path})
+    metas.append({**base, "kind": "file", "name": path})
     ids.append(f"{path}::file")
 
-    # 1 doc moi symbol (kem doc/comment de semantic tot hon)
     for i, s in enumerate(symbols):
         text = f"{s['kind']} {s['name']}"
         if s.get("parent"):
@@ -75,18 +84,14 @@ def index_file(path, lang, skeleton, symbols):
         if s.get("doc"):
             text += f"\n{s['doc']}"
         docs.append(text)
-        metas.append({
-            "file_path": path, "lang": lang, "kind": s["kind"],
-            "name": s["name"], "start_line": s["start_line"],
-        })
+        metas.append({**base, "kind": s["kind"], "name": s["name"], "start_line": s["start_line"]})
         ids.append(f"{path}::sym::{i}")
 
     if docs:
         col.add(documents=docs, metadatas=metas, ids=ids)
 
 
-def index_summary(path, lang, summary):
-    """Them/cap nhat doc tom tat cua file vao vector index."""
+def index_summary(path, lang, summary, project_id=None):
     col = get_collection()
     if col is None or not summary:
         return
@@ -95,15 +100,14 @@ def index_summary(path, lang, summary):
         col.delete(ids=[sid])
     except Exception:
         pass
-    col.add(
-        documents=[summary],
-        metadatas=[{"file_path": path, "lang": lang, "kind": "summary", "name": path}],
-        ids=[sid],
-    )
+    col.add(documents=[summary],
+            metadatas=[{"file_path": path, "lang": lang, "kind": "summary",
+                        "name": path, "project_id": project_id}],
+            ids=[sid])
 
 
-def query(text, n=12):
-    """Semantic search -> list metadata (kem _distance de loc nguong)."""
+def query(text, n=12, project_id=None):
+    """Semantic search trong 1 project -> list metadata (kem _distance)."""
     col = get_collection()
     if col is None:
         return []
@@ -111,8 +115,11 @@ def query(text, n=12):
         count = col.count()
         if count == 0:
             return []
-        res = col.query(query_texts=[text], n_results=min(n, count),
-                        include=["metadatas", "distances"])
+        kw = {"query_texts": [text], "n_results": min(n, count),
+              "include": ["metadatas", "distances"]}
+        if project_id is not None:
+            kw["where"] = {"project_id": project_id}
+        res = col.query(**kw)
     except Exception:
         return []
     metas = (res.get("metadatas") or [[]])[0] or []

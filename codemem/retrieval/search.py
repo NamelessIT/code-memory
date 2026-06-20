@@ -9,7 +9,7 @@ _WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
 
 
 def _rel(path):
-    root = db.get_meta("project_root")
+    root = db.get_active_root()
     if root:
         try:
             return os.path.relpath(path, root).replace("\\", "/")
@@ -19,11 +19,12 @@ def _rel(path):
 
 
 def _candidates(query: str):
-    """Gop semantic (loc theo nguong) + lexical (theo tung token). Loai trung."""
+    """Gop semantic (loc theo nguong) + lexical (theo tung token). Loai trung. Scope project active."""
     seen, out = set(), []
+    pid = db.active_project_id()
 
-    # 1) Semantic — chi giu cai du gan (distance <= nguong)
-    for m in vectors.query(query, n=TOP_K):
+    # 1) Semantic — chi giu cai du gan (distance <= nguong), trong project active
+    for m in vectors.query(query, n=TOP_K, project_id=pid):
         if m.get("kind") in ("file", "summary"):
             continue
         dist = m.get("_distance")
@@ -58,7 +59,7 @@ def build_context(query: str):
         return "", []
 
     lines = []
-    overview = db.get_meta("overview")
+    overview = db.get_overview()
     if overview:
         lines += ["=== TONG QUAN DU AN (do AI tom tat tu evidence) ===", overview[:1200], ""]
 

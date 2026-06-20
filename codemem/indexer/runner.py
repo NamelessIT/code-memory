@@ -16,13 +16,11 @@ def index_project(root: str, progress=None):
     db.init_db()
     root = str(Path(root).resolve())
 
-    # Doi sang project khac -> wipe index cu de khong cong don (tranh SQLite/Chroma phinh)
-    prev = db.get_status().get("project_root")
-    if prev and prev != root:
-        db.clear_all()
-        vectors.clear_all()
+    # Multi-project: lay/tao project, set active. KHONG wipe project khac.
+    pid = db.get_or_create_project(root)
+    db.set_active_project(pid)
 
-    existing = db.get_indexed_hashes()      # {path: hash}
+    existing = db.get_indexed_hashes(pid)    # {path: hash} cua RIENG project nay
     seen = set()
 
     n_new = n_upd = n_skip = n_err = 0
@@ -44,8 +42,8 @@ def index_project(root: str, progress=None):
             rel = os.path.relpath(spath, root).replace("\\", "/")  # rel path: tag/skeleton chinh xac
             r = parse_file(content, lang, rel)
             skeleton = build_skeleton(rel, r["symbols"], r["imports"])
-            db.upsert_file(spath, lang, h, skeleton, r["symbols"], r["edges"], r["routes"])
-            vectors.index_file(spath, lang, skeleton, r["symbols"])
+            db.upsert_file(spath, lang, h, skeleton, r["symbols"], r["edges"], r["routes"], project_id=pid)
+            vectors.index_file(spath, lang, skeleton, r["symbols"], project_id=pid)
             if spath in existing:
                 n_upd += 1
             else:
@@ -57,16 +55,16 @@ def index_project(root: str, progress=None):
             if progress:
                 progress(f"[err] {spath}: {e}")
 
-    # File da bi xoa khoi disk -> go khoi index
-    removed = [p for p in existing if p not in seen and p.startswith(root)]
+    # File da bi xoa khoi disk -> go khoi index (trong project nay)
+    removed = [p for p in existing if p not in seen]
     for p in removed:
         db.delete_file(p)
         vectors.delete_file(p)
 
-    db.set_meta("project_root", root)
+    db.touch_project(pid)
 
     return {
-        "project_root": root,
+        "project_root": root, "project_id": pid,
         "new": n_new, "updated": n_upd, "skipped": n_skip,
         "removed": len(removed), "errors": n_err,
     }
@@ -79,14 +77,15 @@ def index_single_file(path: str):
     if not lang or not p.is_file():
         return False
     try:
-        content = read_text(p)
-        root = db.get_meta("project_root") or str(p.parent)
+        pid = db.active_project_id()
+        root = db.get_active_root() or str(p.parent)
         rel = os.path.relpath(str(p), root).replace("\\", "/")
+        content = read_text(p)
         r = parse_file(content, lang, rel)
         skeleton = build_skeleton(rel, r["symbols"], r["imports"])
         h = file_hash(p)
-        db.upsert_file(str(p), lang, h, skeleton, r["symbols"], r["edges"], r["routes"])
-        vectors.index_file(str(p), lang, skeleton, r["symbols"])
+        db.upsert_file(str(p), lang, h, skeleton, r["symbols"], r["edges"], r["routes"], project_id=pid)
+        vectors.index_file(str(p), lang, skeleton, r["symbols"], project_id=pid)
         return True
     except Exception:
         return False
