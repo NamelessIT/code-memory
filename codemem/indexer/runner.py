@@ -52,17 +52,22 @@ def ensure_embed_current():
     return False
 
 
-def _retry_tombstones():
-    """Retry cac vector delete tung that bai (#P0-10). Goi trong reconcile."""
+def _retry_tombstones(batch=50):
+    """Retry cleanup intent den han (fair batching + backoff). Tra so da clear (#P0-10)."""
     cleared = 0
-    for t in db.list_tombstones():
-        if t["scope"] == "project":
+    for t in db.due_tombstones(batch):
+        scope = t["scope"]
+        if scope == "collection":
+            ok = vectors.clear_all()
+        elif scope == "project":
             ok = vectors.delete_project(t["project_id"])
         else:
             ok = vectors.delete_file(t["file_path"], project_id=t["project_id"])
         if ok:
             db.del_tombstone(t["id"])
             cleared += 1
+        else:
+            db.record_tombstone_failure(t["id"], "vector delete failed")
     return cleared
 
 
@@ -122,7 +127,7 @@ def index_project(root: str, progress=None):
     for p in removed:
         db.delete_file(p, project_id=pid)
         if not vectors.delete_file(p, project_id=pid):
-            db.add_tombstone(pid, p, "file")     # vector delete fail -> retry sau (#P0-10)
+            db.add_tombstone("file", pid, p)     # vector delete fail -> retry sau (#P0-10)
 
     # Repair vector pending (ke ca file unchanged nhung vector tung loi)
     rec = reconcile_vectors(pid, progress)
@@ -162,4 +167,4 @@ def remove_file(path: str, project_id=None):
     sp = os.path.normcase(str(Path(path)))
     db.delete_file(sp, project_id=pid)
     if not vectors.delete_file(sp, project_id=pid):
-        db.add_tombstone(pid, sp, "file")        # vector delete fail -> retry sau (#P0-10)
+        db.add_tombstone("file", pid, sp)        # vector delete fail -> retry sau (#P0-10)

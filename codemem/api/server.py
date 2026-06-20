@@ -51,6 +51,7 @@ def health():
         "vector": vectors.health(),         # chroma ok? embedding failed? reason
         "active_project": p["name"] if p else None,
         "watcher": watcher.observer is not None,
+        "cleanup": db.tombstone_stats(),    # pending/failed/last_error cleanup intent (#P0-10)
     }
 
 
@@ -109,7 +110,7 @@ def project_delete(body: ProjectBody):
         db.delete_project(body.id)          # tu chon active ke tiep neu xoa active
         vec_ok = vectors.delete_project(body.id)
         if not vec_ok:
-            db.add_tombstone(body.id, None, "project")   # retry xoa vector sau (#P0-10)
+            db.add_tombstone("project", body.id)         # retry xoa vector sau (#P0-10)
         p = db.get_active_project()
         if p and os.path.isdir(p["root"]):
             try:
@@ -217,13 +218,16 @@ def reset():
 @app.post("/api/clear")
 def clear_index():
     """Xoa toan bo index (SQLite + ChromaDB). Dung watcher + reset chat (#P0-10)."""
-    watcher.stop()
-    with INDEX_LOCK:                       # serialize voi index/reconcile (#P0-6)
+    with INDEX_LOCK:                       # stop trong lock (#P0-6): index dang cho khong start lai watcher
+        watcher.stop()
         db.init_db()
-        db.clear_all()
-        vec_ok = vectors.clear_all()       # partial result: bao ro vector co xoa duoc khong
-    session.history.clear()                # evidence da mat -> khong giu chat cu
-    return {"ok": True, "sqlite_cleared": True, "vector_cleared": vec_ok}
+        db.clear_all()                     # da wipe ca vector_tombstones cu
+        vec_ok = vectors.clear_all()
+        if not vec_ok:                     # clear vector fail -> intent retry collection (#P0-10)
+            db.add_tombstone("collection")
+        session.history.clear()            # evidence da mat -> khong giu chat cu
+    return {"ok": True, "sqlite_cleared": True, "vector_cleared": vec_ok,
+            "pending_cleanup": db.tombstone_stats()["pending"]}
 
 
 # Phuc vu Web UI (mount cuoi cung de khong de len API routes)

@@ -33,26 +33,31 @@ def test_reconcile_still_pending_on_failure(monkeypatch):
 
 
 def test_retry_tombstones_clears_on_success(monkeypatch):
-    # #P0-10: tombstone retry thanh cong -> xoa khoi danh sach
-    tombs = [{"id": 1, "project_id": 2, "file_path": "/p/a.py", "scope": "file"},
-             {"id": 2, "project_id": 3, "file_path": None, "scope": "project"}]
-    monkeypatch.setattr(runner.db, "list_tombstones", lambda: tombs)
+    # #P0-10: retry thanh cong moi scope -> xoa khoi danh sach
+    tombs = [{"id": 1, "scope": "file", "project_id": 2, "file_path": "/p/a.py"},
+             {"id": 2, "scope": "project", "project_id": 3, "file_path": ""},
+             {"id": 3, "scope": "collection", "project_id": 0, "file_path": ""}]
+    monkeypatch.setattr(runner.db, "due_tombstones", lambda batch=50: tombs)
     monkeypatch.setattr(runner.vectors, "delete_file", lambda p, project_id=None: True)
     monkeypatch.setattr(runner.vectors, "delete_project", lambda pid: True)
+    monkeypatch.setattr(runner.vectors, "clear_all", lambda: True)
     deleted = []
     monkeypatch.setattr(runner.db, "del_tombstone", lambda tid: deleted.append(tid))
-    assert runner._retry_tombstones() == 2
-    assert deleted == [1, 2]
+    assert runner._retry_tombstones() == 3
+    assert deleted == [1, 2, 3]
 
 
-def test_retry_tombstones_keeps_on_failure(monkeypatch):
-    monkeypatch.setattr(runner.db, "list_tombstones",
-                        lambda: [{"id": 1, "project_id": 2, "file_path": "/p/a.py", "scope": "file"}])
+def test_retry_tombstones_backoff_on_failure(monkeypatch):
+    # #P0-10: fail -> record_tombstone_failure (backoff), KHONG del
+    monkeypatch.setattr(runner.db, "due_tombstones",
+                        lambda batch=50: [{"id": 1, "scope": "file", "project_id": 2, "file_path": "/p/a.py"}])
     monkeypatch.setattr(runner.vectors, "delete_file", lambda p, project_id=None: False)
-    deleted = []
-    monkeypatch.setattr(runner.db, "del_tombstone", lambda tid: deleted.append(tid))
+    failed = []
+    monkeypatch.setattr(runner.db, "record_tombstone_failure", lambda tid, err="": failed.append(tid))
+    monkeypatch.setattr(runner.db, "del_tombstone",
+                        lambda tid: (_ for _ in ()).throw(AssertionError("khong duoc del khi fail")))
     assert runner._retry_tombstones() == 0
-    assert deleted == []                    # giu lai de retry sau
+    assert failed == [1]
 
 
 def test_ensure_embed_current_marks_stale(tmp_path, monkeypatch):

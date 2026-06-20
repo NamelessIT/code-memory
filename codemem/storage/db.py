@@ -55,12 +55,37 @@ def init_db():
             method TEXT, path TEXT, handler TEXT, line INTEGER
         );
         CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
-        -- Vector delete that bai sau khi SQLite da xoa -> luu de retry (#P0-10)
+        -- Cleanup intent ben vung: vector delete that bai -> retry idempotent (#P0-10)
+        -- scope: file|project|collection. NULL tranh dung de UNIQUE dedup duoc.
         CREATE TABLE IF NOT EXISTS vector_tombstones (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            project_id INTEGER, file_path TEXT, scope TEXT, created_at TEXT
+            scope TEXT NOT NULL,
+            project_id INTEGER NOT NULL DEFAULT 0,
+            file_path TEXT NOT NULL DEFAULT '',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT DEFAULT '',
+            next_retry TEXT DEFAULT '',
+            created_at TEXT,
+            UNIQUE(scope, project_id, file_path)
         );
     """)
+    # Recreate vector_tombstones cu (round truoc, thieu cot attempts/dedup)
+    tcols = [r["name"] for r in conn.execute("PRAGMA table_info(vector_tombstones)")]
+    if "attempts" not in tcols:
+        conn.executescript("""
+            DROP TABLE IF EXISTS vector_tombstones;
+            CREATE TABLE vector_tombstones (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scope TEXT NOT NULL,
+                project_id INTEGER NOT NULL DEFAULT 0,
+                file_path TEXT NOT NULL DEFAULT '',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT DEFAULT '',
+                next_retry TEXT DEFAULT '',
+                created_at TEXT,
+                UNIQUE(scope, project_id, file_path)
+            );
+        """)
     # Migration cot cho DB cu (truoc multi-project)
     for stmt in (
         "ALTER TABLE symbols ADD COLUMN tag TEXT DEFAULT ''",
@@ -218,15 +243,12 @@ def _migrate_canonical_roots(conn):
         conn.execute("INSERT INTO meta(key,value) VALUES('active_project_id',?) "
                      "ON CONFLICT(key) DO UPDATE SET value=?", (str(active), str(active)))
 
-    # Best-effort don vector orphan (dup project + file da doi path/project)
-    try:
-        from . import vectors
-        for dp in dup_pids:
-            vectors.delete_project(dp)
-        for (pidx, path) in vec_cleanup:
-            vectors.delete_file(path, project_id=pidx)
-    except Exception:
-        pass
+    # Ghi cleanup intent (tombstone) trong CUNG transaction migration -> durable, worker retry sau.
+    # KHONG goi Chroma o day (side-effect khong ben trong transaction) - #P0-8/#P0-10.
+    items = [("project", dp, "") for dp in dup_pids] + \
+            [("file", pidx, path) for (pidx, path) in vec_cleanup]
+    if items:
+        add_tombstones_bulk(conn, items)
 
 
 # ============================================================
@@ -313,6 +335,8 @@ def delete_project(pid):
         conn.execute(f"DELETE FROM {t} WHERE project_id=?", (pid,))
     conn.execute("DELETE FROM projects WHERE id=?", (pid,))
     conn.execute("DELETE FROM meta WHERE key=?", (f"overview:{pid}",))
+    # Collapse cleanup intent file cu cua project nay (#P0-10); intent project-scope se them sau neu can
+    conn.execute("DELETE FROM vector_tombstones WHERE project_id=? AND scope='file'", (pid,))
     if was_active:
         nxt = conn.execute("SELECT id FROM projects ORDER BY id LIMIT 1").fetchone()
         if nxt:
@@ -396,20 +420,53 @@ def set_vector_ok(path, ok, project_id):
     conn.close()
 
 
-def add_tombstone(project_id, file_path=None, scope="file"):
-    """Ghi 1 vector delete that bai de retry sau (#P0-10)."""
+_RETRY_BASE = 5          # giay
+_RETRY_CAP = 3600        # 1 gio
+
+
+def add_tombstone(scope, project_id=0, file_path=""):
+    """Ghi cleanup intent (dedup theo (scope,project_id,file_path)). Due ngay (#P0-10)."""
     conn = _conn()
-    conn.execute("INSERT INTO vector_tombstones(project_id, file_path, scope, created_at) VALUES (?,?,?,?)",
-                 (project_id, file_path, scope, datetime.now().isoformat()))
+    now = datetime.now().isoformat()
+    conn.execute(
+        "INSERT OR IGNORE INTO vector_tombstones(scope, project_id, file_path, next_retry, created_at) "
+        "VALUES (?,?,?,?,?)", (scope, project_id or 0, file_path or "", now, now))
     conn.commit()
     conn.close()
 
 
-def list_tombstones(limit=500):
+def add_tombstones_bulk(conn, items):
+    """Ghi nhieu tombstone trong CUNG transaction (dung trong migration). items: [(scope,pid,path)]."""
+    now = datetime.now().isoformat()
+    conn.executemany(
+        "INSERT OR IGNORE INTO vector_tombstones(scope, project_id, file_path, next_retry, created_at) "
+        "VALUES (?,?,?,?,?)",
+        [(s, p or 0, fp or "", now, now) for (s, p, fp) in items])
+
+
+def due_tombstones(limit=50):
+    """Cac intent den han (next_retry <= now), uu tien han som nhat -> chong starvation (#P0-10)."""
     conn = _conn()
-    rows = conn.execute("SELECT * FROM vector_tombstones ORDER BY id LIMIT ?", (limit,)).fetchall()
+    now = datetime.now().isoformat()
+    rows = conn.execute(
+        "SELECT * FROM vector_tombstones WHERE next_retry <= ? ORDER BY next_retry, id LIMIT ?",
+        (now, limit)).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def record_tombstone_failure(tid, error=""):
+    """Tang attempts + backoff next_retry (exponential, cap 1h) + last_error."""
+    conn = _conn()
+    row = conn.execute("SELECT attempts FROM vector_tombstones WHERE id=?", (tid,)).fetchone()
+    attempts = (row["attempts"] if row else 0) + 1
+    delay = min(_RETRY_CAP, _RETRY_BASE * (2 ** min(attempts, 20)))
+    from datetime import timedelta
+    nxt = (datetime.now() + timedelta(seconds=delay)).isoformat()
+    conn.execute("UPDATE vector_tombstones SET attempts=?, last_error=?, next_retry=? WHERE id=?",
+                 (attempts, (error or "")[:300], nxt, tid))
+    conn.commit()
+    conn.close()
 
 
 def del_tombstone(tid):
@@ -417,6 +474,16 @@ def del_tombstone(tid):
     conn.execute("DELETE FROM vector_tombstones WHERE id=?", (tid,))
     conn.commit()
     conn.close()
+
+
+def tombstone_stats():
+    conn = _conn()
+    pending = conn.execute("SELECT COUNT(*) c FROM vector_tombstones").fetchone()["c"]
+    failed = conn.execute("SELECT COUNT(*) c FROM vector_tombstones WHERE attempts>0").fetchone()["c"]
+    le = conn.execute("SELECT last_error FROM vector_tombstones WHERE attempts>0 "
+                      "ORDER BY id DESC LIMIT 1").fetchone()
+    conn.close()
+    return {"pending": pending, "failed": failed, "last_error": le["last_error"] if le else None}
 
 
 def mark_all_vectors_stale(project_id=None):
@@ -563,7 +630,7 @@ def clear_all():
     """Xoa SACH toan bo (moi project). Dung cho /api/clear va test."""
     init_db()
     conn = _conn()
-    for t in ("symbols", "edges", "routes", "files", "projects", "meta"):
+    for t in ("symbols", "edges", "routes", "files", "projects", "meta", "vector_tombstones"):
         conn.execute(f"DELETE FROM {t}")
     conn.commit()
     conn.execute("VACUUM")
