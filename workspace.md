@@ -231,5 +231,32 @@ Lệnh kiểm tra tối thiểu:
 ## CLAUDE_REPORT — temporary handoff
 
 <!-- CLAUDE_REPORT_START -->
-Claude Code: thay placeholder này bằng báo cáo của vòng triển khai mới. Không xóa marker.
+## Vòng — P0 round 5
+
+**Commit:** work `16726fb` (report commit ngay sau). **Working tree:** clean sau report.
+**Env:** Python 3.12.13 (venv Ollama), chromadb 1.5.9, watchdog 6.0.0.
+
+### Task đã xử lý
+- **P0-8 (migration rollout):** đổi marker `roots_canon_v1` → **`roots_canon_v2`** → DB đã chạy bản v1 lỗi sẽ **re-run** bản đã sửa (repro "vẫn còn 2 projects" hết). Migration giờ set `group_changed` và **invalidate `overview:{keep}` khi BẤT KỲ merge/move/đổi-root** (không chỉ khi root đổi) → repro "overview cũ STALE sau merge" hết.
+- **P0-6 (race check↔mutate):** `project_select` + `project_delete` chuyển `project_exists` check **vào trong `INDEX_LOCK`** → không còn cửa sổ project bị xoá giữa check và mutate; toàn bộ stop→mutate→start trong lock.
+- **P0-10 (tombstone/retry):** bảng `vector_tombstones`; khi vector delete **fail sau** SQLite delete (index removed-loop, `remove_file`, `/api/project/delete`) → ghi tombstone; `reconcile_vectors` gọi `_retry_tombstones()` retry (xoá tombstone khi thành công, giữ khi vẫn fail) + trả `tombstones_cleared`.
+- **P0-5 (staleness dùng chung):** `ensure_embed_current()` (đổi embedding model → `mark_all_vectors_stale` + cập nhật meta) gọi trong **cả** `index_project` và `reconcile_vectors` → áp dụng cho startup/manual(`/api/reconcile`)/switch, không chỉ index.
+
+### File/API đã đổi
+- `codemem/storage/db.py`: marker v2; `group_changed` + overview invalidate; bảng `vector_tombstones` + `add/list/del_tombstone`.
+- `codemem/indexer/runner.py`: `ensure_embed_current`, `_retry_tombstones`; reconcile gọi cả hai; removed-loop/remove_file ghi tombstone khi vector delete fail.
+- `codemem/api/server.py`: select/delete check-trong-lock; delete ghi tombstone khi vector fail.
+
+### Test + kết quả
+- `python -m pytest tests -q` → **40 passed** (mới: tombstone retry clear/keep; `ensure_embed_current` marks stale + no-op lần 2; overview invalidate khi merge; migration v2 dedup file thật → 1 project/1 file/vector_ok=0).
+- `compileall` pass; `node --check web/app.js` pass; server import **25 routes**; status files 27 / vector_pending 0 / tombstones 0.
+
+### Partial / chưa làm
+- **P0-5**: vẫn **chưa có inventory/content-hash** đối chiếu vector thực tế (collection mất/corrupt ngoài khi DB vector_ok=1 → chưa phát hiện); summary-embedding chưa có version/pending; startup vẫn chỉ reconcile **active** project (project khác repair khi switch). `ensure_embed_current` mới ở index/reconcile — chưa gọi tường minh ngay startup trước khi reconcile active (reconcile active có gọi nó, nên model-change vẫn được bắt cho active).
+- **P0-6**: generation guard vẫn **không hủy callback đang ghi dở** (lock chỉ tuần tự hoá); **summarizer vẫn ngoài INDEX_LOCK** (gắn P1-16); chưa có structured job log/retry; chưa có deterministic **API**-concurrency test (mới unit/lock-level).
+- **P0-10**: tombstone retry chạy trong `reconcile_vectors` (index/switch/manual/startup) — chưa có endpoint/job retry tombstone độc lập + chưa surface UI; `/api/clear` fail không tạo tombstone (projects đã bị xoá nên không lặp được — clear trả `vector_cleared=false` để user biết).
+- **P0-8**: chưa backup/rollback chính thức quanh migration; chưa test junction thật (chỉ casing/separator). Vector cleanup trong migration vẫn best-effort try/except (không tombstone).
+
+### Regression
+- Không. 40/40 pass gồm toàn bộ test cũ; health chroma true.
 <!-- CLAUDE_REPORT_END -->
