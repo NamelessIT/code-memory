@@ -9,7 +9,16 @@ def _conn():
     ensure_dirs()
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=5000")   # cho lock thay vi loi 'database is locked' (#P0-10)
     return conn
+
+
+def _safe_int(v, default=0):
+    """Parse int an toan; meta malformed (vd 'broken') -> default thay vi ValueError (#P0-10)."""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
 
 
 def _active_pid(conn):
@@ -19,6 +28,13 @@ def _active_pid(conn):
 
 def init_db():
     conn = _conn()
+    try:
+        _init_db_impl(conn)
+    finally:
+        conn.close()                            # dong deterministic (chong khoa file DB tren Windows) (#P0-10)
+
+
+def _init_db_impl(conn):
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS projects (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -187,17 +203,16 @@ def init_db():
                      "ON CONFLICT(key) DO UPDATE SET value='1'")
 
     # Repair invariant generation (#P0-10): meta.vec_gen_seq >= max(file gen, tombstone gen).
-    # Sau restore/import lam mat/stale meta, dam bao gen cap sau khong tut duoi vector cu.
+    # Coi meta thieu/thap/MALFORMED ('broken') deu la can repair tu max thuc te (khong raise ValueError).
     seqrow = conn.execute("SELECT value FROM meta WHERE key='vec_gen_seq'").fetchone()
-    seq = int(seqrow["value"]) if seqrow and seqrow["value"] else 0
+    seq = _safe_int(seqrow["value"], None) if seqrow else None
     fmax = conn.execute("SELECT COALESCE(MAX(vector_gen),0) m FROM files").fetchone()["m"]
     tmax = conn.execute("SELECT COALESCE(MAX(generation),0) m FROM vector_tombstones").fetchone()["m"]
-    want = max(seq, fmax, tmax)
-    if want != seq:
+    want = max(seq if seq is not None else 0, fmax, tmax)
+    if seq is None or seq != want:             # malformed/missing/thap -> ghi lai gia tri dung
         conn.execute("INSERT INTO meta(key,value) VALUES('vec_gen_seq',?) "
                      "ON CONFLICT(key) DO UPDATE SET value=?", (str(want), str(want)))
     conn.commit()
-    conn.close()
 
 
 def _name_from_root(root):
@@ -413,9 +428,9 @@ def upsert_file(path, lang, file_hash, skeleton, symbols, edges=None, routes=Non
     - crash giua upsert va embedding -> vector_ok=0 (reconcile se sua), khong bao gia 'da co vector'.
     - vector_gen tang don dieu -> intent xoa cu (gen thap) khong xoa vector moi (gen cao).
     Tra ve generation de caller tag vector."""
+    gen = allocate_generation()              # atomic, monotonic (#P0-10) - truoc khi mo conn ghi file
     conn = _conn()
     now = datetime.now().isoformat()
-    gen = _next_generation(conn)
     # Identity = (project_id, path) -> project long nhau khong ghi de nhau
     conn.execute(
         "INSERT INTO files(project_id, path, lang, hash, skeleton, indexed_at, summary, vector_ok, vector_gen) "
@@ -497,27 +512,40 @@ def set_vector_ok(path, ok, project_id):
     conn.close()
 
 
-def _next_generation(conn):
-    """Cap generation moi MONOTONIC: max(meta.vec_gen_seq, MAX(files.vector_gen),
-    MAX(vector_tombstones.generation)) + 1, roi ghi lai meta (#P0-10). Chong tut gen sau
-    restore/import/migration lam mat hoac stale meta (gen moi < gen vector cu -> tombstone $lte
-    xoa nham vector moi). Goi TRONG transaction cua caller (dung conn truyen vao)."""
-    row = conn.execute("SELECT value FROM meta WHERE key='vec_gen_seq'").fetchone()
-    seq = int(row["value"]) if row and row["value"] else 0
-    fmax = conn.execute("SELECT COALESCE(MAX(vector_gen),0) m FROM files").fetchone()["m"]
-    tmax = conn.execute("SELECT COALESCE(MAX(generation),0) m FROM vector_tombstones").fetchone()["m"]
-    gen = max(seq, fmax, tmax) + 1
-    conn.execute("INSERT INTO meta(key,value) VALUES('vec_gen_seq',?) "
-                 "ON CONFLICT(key) DO UPDATE SET value=?", (str(gen), str(gen)))
-    return gen
+def allocate_generation():
+    """Cap generation duy nhat, tang nghiem ngat, ATOMIC giua nhieu connection/process (#P0-10).
+    gen = max(meta.vec_gen_seq, MAX(files.vector_gen), MAX(vector_tombstones.generation)) + 1.
+    Dung connection rieng (autocommit) + BEGIN IMMEDIATE: giu write-lock TRUOC khi doc MAX -> hai
+    writer dong thoi khong doc cung max (khong tai su dung gen). busy_timeout cho cho lock.
+    Chong tut gen sau restore/import lam mat/stale/malformed meta. Connection luon dong."""
+    conn = sqlite3.connect(str(DB_PATH), isolation_level=None)   # autocommit -> tu quan ly BEGIN/COMMIT
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("BEGIN IMMEDIATE")          # lay write-lock ngay -> doc-sua-ghi atomic
+        try:
+            row = conn.execute("SELECT value FROM meta WHERE key='vec_gen_seq'").fetchone()
+            seq = _safe_int(row["value"] if row else None)
+            fmax = conn.execute("SELECT COALESCE(MAX(vector_gen),0) m FROM files").fetchone()["m"]
+            tmax = conn.execute("SELECT COALESCE(MAX(generation),0) m FROM vector_tombstones").fetchone()["m"]
+            gen = max(seq, fmax, tmax) + 1
+            conn.execute("INSERT INTO meta(key,value) VALUES('vec_gen_seq',?) "
+                         "ON CONFLICT(key) DO UPDATE SET value=?", (str(gen), str(gen)))
+            conn.execute("COMMIT")
+            return gen
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    finally:
+        conn.close()
 
 
 def reserve_file_generation(path, project_id):
-    """Cap generation moi (monotonic) + gan cho file (atomic). Tra ve generation moi (>0).
+    """Cap generation moi (atomic) + gan cho file. Tra ve generation moi (>0).
     Dung khi reconcile file legacy vector_gen=0 -> cap generation that TRUOC khi ghi vector,
     de vector metadata + DB khong con gen0 (#P0-5)."""
+    gen = allocate_generation()
     conn = _conn()
-    gen = _next_generation(conn)
     conn.execute("UPDATE files SET vector_gen=? WHERE project_id=? AND path=?", (gen, project_id, path))
     conn.commit()
     conn.close()

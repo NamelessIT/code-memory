@@ -174,6 +174,53 @@ def test_generation_monotonic_after_stale_meta(tmp_path, monkeypatch):
     assert g2 > g                                                     # van monotonic
 
 
+def test_generation_unique_under_concurrency(tmp_path, monkeypatch):
+    # #P0-10: nhieu connection goi upsert_file dong thoi -> generation DUY NHAT, tang nghiem ngat
+    # (repro cu tra [1,1,1,1,2,2,2,2]). allocate_generation BEGIN IMMEDIATE serialize doc-sua-ghi.
+    import threading
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "c.db")
+    db.init_db()
+    pid = db.get_or_create_project("/r", "R")
+    gens = []
+    lock = threading.Lock()
+    barrier = threading.Barrier(8)
+
+    def worker(i):
+        barrier.wait()                           # ep 8 thread ghi gan nhu cung luc
+        g = db.upsert_file(f"/r/f{i}.py", "python", "h", "s", [], project_id=pid)
+        with lock:
+            gens.append(g)
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(gens) == 8
+    assert len(set(gens)) == 8                    # khong tai su dung gen
+    assert max(gens) - min(gens) == 7            # lien tuc tang (khong nhay/trung)
+
+
+def test_init_repairs_malformed_generation_meta(tmp_path, monkeypatch):
+    # #P0-10: vec_gen_seq='broken' -> init_db KHONG raise ValueError, repair tu max thuc te
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "mal.db")
+    db.init_db()
+    pid = db.get_or_create_project("/r", "R")
+    conn = db._conn()
+    conn.execute("INSERT INTO files(project_id,path,lang,hash,skeleton,indexed_at,summary,vector_ok,vector_gen) "
+                 "VALUES (?,?,?,?,?,?,?,1,40)", (pid, "/r/x.py", "python", "h", "s", "t", ""))
+    conn.execute("INSERT INTO meta(key,value) VALUES('vec_gen_seq','broken') "
+                 "ON CONFLICT(key) DO UPDATE SET value='broken'")
+    conn.commit()
+    conn.close()
+    db.init_db()                                 # KHONG duoc raise; repair vec_gen_seq -> 40
+    seqconn = db._conn()
+    seq = seqconn.execute("SELECT value FROM meta WHERE key='vec_gen_seq'").fetchone()["value"]
+    seqconn.close()
+    assert int(seq) == 40                         # repair tu MAX(file gen)
+    g = db.upsert_file("/r/y.py", "python", "h", "s", [], project_id=pid)
+    assert g > 40                                 # gen moi monotonic
+
+
 def test_init_repairs_generation_invariant(tmp_path, monkeypatch):
     # #P0-10: init repair meta.vec_gen_seq >= max(file gen, tombstone gen) khi meta stale/thap
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "gi.db")
