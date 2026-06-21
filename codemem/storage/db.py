@@ -599,14 +599,17 @@ def files_pending_vector(project_id):
     return [dict(r) for r in rows]
 
 
-def file_current_gen(path, project_id=None):
-    """vector_gen hien tai cua file, hoac None neu file khong con trong DB (#P0-10).
-    Dung de phat hien file da bi re-index (gen moi) truoc khi chay legacy ungated delete."""
+def file_vector_state(path, project_id=None):
+    """(vector_gen, vector_ok) cua file, hoac None neu file khong con trong DB (#P0-10).
+    Dung de quyet dinh legacy cleanup: chi coi intent gen0 la stale (ack, khong xoa) khi
+    vector moi da HOAN TAT (gen>0 VA vector_ok=1 -> index_file da don vector cu). Neu gen>0
+    nhung vector_ok=0 (crash truoc khi ghi vector) thi van phai ungated-clean legacy orphan."""
     conn = _conn()
     pid = project_id if project_id is not None else _active_pid(conn)
-    row = conn.execute("SELECT vector_gen FROM files WHERE project_id=? AND path=?", (pid, path)).fetchone()
+    row = conn.execute("SELECT vector_gen, vector_ok FROM files WHERE project_id=? AND path=?",
+                       (pid, path)).fetchone()
     conn.close()
-    return (row["vector_gen"] if row else None)
+    return (row["vector_gen"], row["vector_ok"]) if row else None
 
 
 def get_project_root(pid):

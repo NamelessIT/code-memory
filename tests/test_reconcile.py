@@ -60,13 +60,13 @@ def test_retry_tombstones_backoff_on_failure(monkeypatch):
     assert failed == [1]
 
 
-def test_retry_legacy_gen0_stale_when_file_recreated(monkeypatch):
-    # #P0-10 race: intent legacy gen=0 nhung file da re-index (gen>0) -> ack stale,
-    # KHONG ungated-delete (re-index da don vector cu) de tranh xoa nham vector moi.
+def test_retry_legacy_gen0_stale_when_recreate_complete(monkeypatch):
+    # #P0-10 race: intent legacy gen=0, file da re-index VA vector hoan tat (gen>0, vector_ok=1)
+    # -> ack stale, KHONG ungated-delete (re-index da don vector cu) de tranh xoa nham vector moi.
     monkeypatch.setattr(runner.db, "due_tombstones",
                         lambda batch=50, scopes=None: [{"id": 1, "scope": "file", "project_id": 2,
                                                         "file_path": "/p/a.py", "generation": 0}])
-    monkeypatch.setattr(runner.db, "file_current_gen", lambda path, pid: 7)   # file ton tai lai, gen 7
+    monkeypatch.setattr(runner.db, "file_vector_state", lambda path, pid: (7, 1))   # gen 7, vector_ok=1
     called = []
     monkeypatch.setattr(runner.vectors, "delete_file", lambda *a, **k: called.append(1) or True)
     deleted = []
@@ -75,12 +75,28 @@ def test_retry_legacy_gen0_stale_when_file_recreated(monkeypatch):
     assert deleted == [1] and called == []           # stale -> ack, KHONG goi vector delete
 
 
+def test_retry_legacy_gen0_cleans_when_recreate_incomplete(monkeypatch):
+    # #P0-10 crash-window: upsert gen1 roi crash truoc vector write (vector_ok=0) -> vector legacy
+    # van con. KHONG duoc ack-stale; phai ungated-clean roi ack (reconcile dung vector moi sau).
+    monkeypatch.setattr(runner.db, "due_tombstones",
+                        lambda batch=50, scopes=None: [{"id": 1, "scope": "file", "project_id": 2,
+                                                        "file_path": "/p/a.py", "generation": 0}])
+    monkeypatch.setattr(runner.db, "file_vector_state", lambda path, pid: (1, 0))   # gen 1 nhung vector_ok=0
+    seen = {}
+    monkeypatch.setattr(runner.vectors, "delete_file",
+                        lambda p, project_id=None, generation=None: seen.update({"gen": generation}) or True)
+    deleted = []
+    monkeypatch.setattr(runner.db, "del_tombstone", lambda tid: deleted.append(tid))
+    assert runner._retry_tombstones() == 1
+    assert seen.get("gen") == 0 and deleted == [1]   # ungated-clean legacy + ack sau success
+
+
 def test_retry_legacy_gen0_deletes_when_file_absent(monkeypatch):
     # #P0-10: intent legacy gen=0, file da xoa han (None) -> ungated delete (don orphan)
     monkeypatch.setattr(runner.db, "due_tombstones",
                         lambda batch=50, scopes=None: [{"id": 1, "scope": "file", "project_id": 2,
                                                         "file_path": "/p/a.py", "generation": 0}])
-    monkeypatch.setattr(runner.db, "file_current_gen", lambda path, pid: None)  # file da xoa
+    monkeypatch.setattr(runner.db, "file_vector_state", lambda path, pid: None)  # file da xoa
     seen = {}
     monkeypatch.setattr(runner.vectors, "delete_file",
                         lambda p, project_id=None, generation=None: seen.update({"gen": generation}) or True)
@@ -112,6 +128,19 @@ def test_retry_scopes_filter_excludes_collection(monkeypatch):
     monkeypatch.setattr(runner.db, "del_tombstone", lambda tid: None)
     runner._retry_tombstones(scopes={"file"})
     assert cleared_collection == []                # collection KHONG bi xu ly khi fence
+
+
+def test_file_vector_state_reflects_db(tmp_path, monkeypatch):
+    # #P0-10: helper tra (gen, vector_ok) dung trang thai DB -> guard legacy cleanup quyet dinh dung
+    import codemem.storage.db as db
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "fv.db")
+    db.init_db()
+    pid = db.get_or_create_project("/r", "R")
+    assert db.file_vector_state("/r/x.py", pid) is None        # chua co file
+    g = db.upsert_file("/r/x.py", "python", "h", "s", [], project_id=pid)
+    assert db.file_vector_state("/r/x.py", pid) == (g, 0)      # upsert -> vector_ok=0 (crash-window)
+    db.set_vector_ok("/r/x.py", True, pid)
+    assert db.file_vector_state("/r/x.py", pid) == (g, 1)      # vector hoan tat
 
 
 def test_ensure_embed_current_marks_stale(tmp_path, monkeypatch):

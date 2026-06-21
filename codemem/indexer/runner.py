@@ -64,13 +64,14 @@ def _retry_tombstones(batch=50, scopes=None):
             ok = vectors.delete_project(t["project_id"])
         else:
             gen = t.get("generation")
-            # Legacy ungated delete (gen falsy -> xoa MOI vector cua path) chi an toan khi file da bi
-            # xoa han. Neu file da duoc re-index (ton tai voi gen>0), re-index da tu don vector cu
-            # (index_file goi delete_file ungated truoc khi add) -> intent legacy nay da stale; ack de
-            # tranh xoa nham vector moi (#P0-10 race).
+            # Legacy ungated delete (gen falsy -> xoa MOI vector cua path) chi duoc bo qua khi file
+            # da re-index VA vector moi da HOAN TAT: index_file (goi truoc moi add) da ungated-delete
+            # vector cu -> intent legacy stale, ack. Neu gen>0 nhung vector_ok=0 (crash sau SQLite
+            # upsert truoc khi ghi vector) thi vector legacy van con -> phai ungated-clean roi ack,
+            # de reconcile dung lai vector moi (#P0-10 crash-window).
             if not gen:
-                cur = db.file_current_gen(t["file_path"], t["project_id"])
-                if cur:                       # file ton tai lai voi gen>0 -> intent stale
+                st = db.file_vector_state(t["file_path"], t["project_id"])
+                if st is not None and st[0] and st[1]:   # gen>0 VA vector_ok=1 -> moi vector hoan tat
                     db.del_tombstone(t["id"])
                     cleared += 1
                     continue
