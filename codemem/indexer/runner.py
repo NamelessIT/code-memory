@@ -95,36 +95,54 @@ def cleanup_worker(batch=50):
 # intent dang backoff khong tu chay khi den han. Scheduler lap lai theo interval, co shutdown sach.
 _cleanup_stop = threading.Event()
 _cleanup_thread = None
+_cleanup_lock = threading.Lock()     # bao ve tao/xoa reference -> khong duplicate thread (#P0-10)
 
 
 def start_cleanup_scheduler(interval=60, batch=50):
     """Chay cleanup_worker lap lai moi `interval` giay cho den khi stop. Intent backoff se duoc
-    retry khi den han (next_retry <= now). Idempotent: dang chay -> tra thread hien tai (#P0-10)."""
+    retry khi den han (next_retry <= now). Khoa de KHONG tao thread thu hai khi thread cu con song
+    (ke ca dang stuck) (#P0-10)."""
     global _cleanup_thread
-    if _cleanup_thread is not None and _cleanup_thread.is_alive():
-        return _cleanup_thread
-    _cleanup_stop.clear()
+    with _cleanup_lock:
+        if _cleanup_thread is not None and _cleanup_thread.is_alive():
+            return _cleanup_thread        # dang chay/stuck -> KHONG duplicate
+        _cleanup_stop.clear()
 
-    def _loop():
-        while not _cleanup_stop.is_set():
-            try:
-                cleanup_worker(batch=batch)
-            except Exception as e:
-                print(f"[warn] cleanup scheduler: {e}")
-            _cleanup_stop.wait(interval)       # ngu interval; thoat ngay khi stop duoc set
-    _cleanup_thread = threading.Thread(target=_loop, daemon=True)
-    _cleanup_thread.start()
-    return _cleanup_thread
+        def _loop():
+            while not _cleanup_stop.is_set():
+                try:
+                    cleanup_worker(batch=batch)
+                except Exception as e:
+                    print(f"[warn] cleanup scheduler: {e}")
+                _cleanup_stop.wait(interval)   # ngu interval; thoat ngay khi stop duoc set
+        _cleanup_thread = threading.Thread(target=_loop, daemon=True)
+        _cleanup_thread.start()
+        return _cleanup_thread
 
 
 def stop_cleanup_scheduler(timeout=5):
-    """Dung scheduler sach (shutdown/cancel)."""
+    """Dung scheduler. Tra True khi thread da dung han; False neu con song sau timeout (vd Chroma
+    block) -> GIU reference de start sau KHONG tao duplicate (#P0-10). Event chi dung GIUA cac vong,
+    call dang chay (vd Chroma) van phai chay xong -> stuck van bao False."""
     global _cleanup_thread
     _cleanup_stop.set()
+    with _cleanup_lock:
+        t = _cleanup_thread
+    if t is None:
+        return True
+    t.join(timeout=timeout)
+    with _cleanup_lock:
+        if t.is_alive():
+            return False                  # stuck: KHONG xoa reference (chong duplicate)
+        if _cleanup_thread is t:
+            _cleanup_thread = None
+        return True
+
+
+def cleanup_scheduler_running():
+    """True neu scheduler thread con song (gom ca truong hop stuck) - expose cho health (#P0-10)."""
     t = _cleanup_thread
-    if t is not None:
-        t.join(timeout=timeout)
-        _cleanup_thread = None
+    return t is not None and t.is_alive()
 
 
 @_locked
@@ -158,12 +176,16 @@ def reconcile_vectors(pid, progress=None, include_collection=True):
     repaired = still_pending = 0
     for f in db.files_pending_vector(pid):
         syms = db.get_symbols_for_file(f["path"], project_id=pid)
+        gen = f.get("vector_gen", 0) or 0
+        if not gen:                          # legacy gen0 -> cap generation that truoc khi ghi vector (#P0-5)
+            gen = db.reserve_file_generation(f["path"], pid)
         ok = vectors.index_file(f["path"], f["lang"], f["skeleton"] or "", syms,
-                                project_id=pid, generation=f.get("vector_gen", 0))
-        db.set_vector_ok(f["path"], ok, pid)
+                                project_id=pid, generation=gen)
         if ok:
+            db.set_vector_ok_if_gen(f["path"], pid, gen)   # set OK chi khi vector vua ghi van la gen moi nhat
             repaired += 1
         else:
+            db.set_vector_ok(f["path"], False, pid)        # giu pending de retry
             still_pending += 1
     if progress and (repaired or still_pending or tomb):
         progress(f"reconcile: repaired={repaired}, pending={still_pending}, tombstones_cleared={tomb}")

@@ -11,20 +11,21 @@ def _isolate(monkeypatch):
 def test_reconcile_repairs_pending(monkeypatch):
     _isolate(monkeypatch)
     monkeypatch.setattr(runner.db, "files_pending_vector",
-                        lambda pid: [{"path": "/p/a.py", "lang": "python", "skeleton": "s"}])
+                        lambda pid: [{"path": "/p/a.py", "lang": "python", "skeleton": "s", "vector_gen": 5}])
     monkeypatch.setattr(runner.db, "get_symbols_for_file", lambda p, project_id=None: [])
     monkeypatch.setattr(runner.vectors, "index_file", lambda *a, **k: True)
     setok = {}
-    monkeypatch.setattr(runner.db, "set_vector_ok", lambda path, ok, pid: setok.update({path: ok}))
+    monkeypatch.setattr(runner.db, "set_vector_ok_if_gen",
+                        lambda path, pid, gen: setok.update({path: gen}) or True)
     res = runner.reconcile_vectors(1)
     assert res["repaired"] == 1 and res["pending"] == 0
-    assert setok["/p/a.py"] is True
+    assert setok["/p/a.py"] == 5                   # set OK theo gen hien co (khong reserve lai)
 
 
 def test_reconcile_still_pending_on_failure(monkeypatch):
     _isolate(monkeypatch)
     monkeypatch.setattr(runner.db, "files_pending_vector",
-                        lambda pid: [{"path": "/p/a.py", "lang": "python", "skeleton": "s"}])
+                        lambda pid: [{"path": "/p/a.py", "lang": "python", "skeleton": "s", "vector_gen": 3}])
     monkeypatch.setattr(runner.db, "get_symbols_for_file", lambda p, project_id=None: [])
     monkeypatch.setattr(runner.vectors, "index_file", lambda *a, **k: False)  # vector van loi
     monkeypatch.setattr(runner.db, "set_vector_ok", lambda *a, **k: None)
@@ -141,6 +142,57 @@ def test_file_vector_state_reflects_db(tmp_path, monkeypatch):
     assert db.file_vector_state("/r/x.py", pid) == (g, 0)      # upsert -> vector_ok=0 (crash-window)
     db.set_vector_ok("/r/x.py", True, pid)
     assert db.file_vector_state("/r/x.py", pid) == (g, 1)      # vector hoan tat
+
+
+def test_reconcile_legacy_gen0_allocates_real_generation(tmp_path, monkeypatch):
+    # #P0-5: file legacy vector_gen=0 -> reconcile cap generation that (>0) truoc khi ghi vector,
+    # set vector_ok=1 theo gen do; KHONG re-embed lai bang gen0.
+    import codemem.storage.db as db
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "rg.db")
+    db.init_db()
+    pid = db.get_or_create_project("/r", "R")
+    conn = db._conn()
+    conn.execute("INSERT INTO files(project_id,path,lang,hash,skeleton,indexed_at,summary,vector_ok,vector_gen) "
+                 "VALUES (?,?,?,?,?,?,?,0,0)", (pid, "/r/x.py", "python", "h", "skel", "t", ""))
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(runner, "ensure_embed_current", lambda: False)
+    monkeypatch.setattr(runner, "_retry_tombstones", lambda *a, **k: 0)
+    monkeypatch.setattr(runner.db, "get_symbols_for_file", lambda p, project_id=None: [])
+    seen = {}
+    monkeypatch.setattr(runner.vectors, "index_file",
+                        lambda path, lang, skel, syms, project_id=None, generation=0:
+                        seen.update({"gen": generation}) or True)
+    res = runner.reconcile_vectors(pid)
+    assert res["repaired"] == 1
+    assert seen["gen"] >= 1                          # da cap generation that (khong con 0)
+    assert db.file_vector_state("/r/x.py", pid) == (seen["gen"], 1)   # DB gen moi + vector_ok=1
+
+
+def test_cleanup_scheduler_stop_keeps_reference_when_stuck(monkeypatch):
+    # #P0-10: stop khi worker block -> tra False (stuck), GIU reference; start KHONG tao duplicate.
+    import threading
+    release = threading.Event()
+    started = threading.Event()
+
+    def stuck_worker(batch=50):
+        started.set()
+        release.wait(5)                              # mo phong Chroma treo
+        return 0
+    monkeypatch.setattr(runner, "cleanup_worker", stuck_worker)
+    runner.start_cleanup_scheduler(interval=0.01, batch=5)
+    try:
+        assert started.wait(2.0)
+        ok = runner.stop_cleanup_scheduler(timeout=0.1)
+        assert ok is False                           # thread con block -> bao stuck
+        assert runner._cleanup_thread is not None    # GIU reference (chong duplicate)
+        t_before = runner._cleanup_thread
+        t2 = runner.start_cleanup_scheduler(interval=0.01)
+        assert t2 is t_before                         # khong tao thread thu hai
+    finally:
+        release.set()
+        assert runner.stop_cleanup_scheduler(timeout=2.0) is True
+    assert runner._cleanup_thread is None             # dung sach sau khi worker tha
 
 
 def test_reconcile_all_projects_covers_every_project(monkeypatch):

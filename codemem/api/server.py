@@ -45,6 +45,7 @@ def status():
 def health():
     """Trang thai he thong (khong ep load embedding)."""
     db.init_db()
+    from ..indexer.runner import cleanup_scheduler_running
     p = db.get_active_project()
     return {
         "db": True,
@@ -52,6 +53,7 @@ def health():
         "active_project": p["name"] if p else None,
         "watcher": watcher.observer is not None,
         "cleanup": db.tombstone_stats(),    # pending/failed/last_error cleanup intent (#P0-10)
+        "cleanup_scheduler": cleanup_scheduler_running(),  # scheduler con song? (#P0-10)
     }
 
 

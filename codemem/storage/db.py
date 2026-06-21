@@ -489,6 +489,33 @@ def set_vector_ok(path, ok, project_id):
     conn.close()
 
 
+def reserve_file_generation(path, project_id):
+    """Bump vec_gen_seq toan cuc + gan cho file (atomic). Tra ve generation moi (>0).
+    Dung khi reconcile file legacy vector_gen=0 -> cap generation that TRUOC khi ghi vector,
+    de vector metadata + DB khong con gen0 (#P0-5)."""
+    conn = _conn()
+    grow = conn.execute("SELECT value FROM meta WHERE key='vec_gen_seq'").fetchone()
+    gen = (int(grow["value"]) if grow and grow["value"] else 0) + 1
+    conn.execute("INSERT INTO meta(key,value) VALUES('vec_gen_seq',?) "
+                 "ON CONFLICT(key) DO UPDATE SET value=?", (str(gen), str(gen)))
+    conn.execute("UPDATE files SET vector_gen=? WHERE project_id=? AND path=?", (gen, project_id, path))
+    conn.commit()
+    conn.close()
+    return gen
+
+
+def set_vector_ok_if_gen(path, project_id, generation):
+    """Set vector_ok=1 CHI khi files.vector_gen == generation (vector vua ghi van la moi nhat).
+    Tranh danh dau OK cho vector cu khi da co re-index gen cao hon (#P0-5). Tra True neu da set."""
+    conn = _conn()
+    cur = conn.execute("UPDATE files SET vector_ok=1 WHERE project_id=? AND path=? AND vector_gen=?",
+                       (project_id, path, generation))
+    changed = cur.rowcount
+    conn.commit()
+    conn.close()
+    return changed > 0
+
+
 _RETRY_BASE = 5          # giay
 _RETRY_CAP = 3600        # 1 gio
 
