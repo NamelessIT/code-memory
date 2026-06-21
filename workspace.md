@@ -28,11 +28,11 @@
 
 ## Baseline đã được Codex xác minh
 
-- Reviewed implementation commit: e725a30; report commit: ab7575c.
-- Full suite: 67 passed.
+- Reviewed implementation commit: ada1dbd; report commit: e59836f.
+- Full suite: 69 passed.
 - python -m compileall -q codemem: pass.
 - node --check web/app.js: pass.
-- P0 đã xác minh và đã xóa/thu gọn: reconcile-all duyệt mọi project, scheduler cleanup chạy lặp theo interval, shutdown hook cơ bản, legacy gen0 crash-window guard và các fix vòng trước.
+- P0 đã xác minh và đã xóa/thu gọn: reconcile-all duyệt mọi project; legacy gen0 được cấp generation thật và chỉ set `vector_ok=1` nếu generation còn khớp; scheduler cleanup chạy lặp, giữ reference khi stop timeout và không tạo duplicate worker; shutdown hook cơ bản và các fix vòng trước.
 - Không được làm regression các phần trên.
 
 ## ACTIVE TASKS
@@ -42,8 +42,6 @@
 files.vector_ok, startup/manual/switch reconcile và embed-model marker đã có. Phần còn lại:
 
 - Reconcile chỉ thấy vector_ok=0; collection mất/corrupt bên ngoài trong khi DB còn 1 không được phát hiện.
-- Startup đã gọi reconcile-all, nhưng **legacy gen0 không được cấp generation mới**. Codex repro: reconcile truyền generation `[0]`, sau đó DB `vector_gen=0` và `vector_ok=1`; vì vậy 7 file legacy sẽ không bao giờ normalize thành gen>0 dù reconcile mọi project.
-- Thêm helper atomic reserve/bump generation cho pending legacy trước vector write; set vector_ok=1 phải conditional theo generation vừa ghi. Test reconcile gen0 → DB/vector metadata gen>0.
 - EMBED_MODEL đổi nhưng vẫn dùng collection cố định `code`; nếu model mới khác dimension/config, mark stale rồi add vào collection cũ có thể fail vĩnh viễn. Meta lại được cập nhật trước khi rebuild thành công.
 - Summary query/generation cơ bản đã sửa, nhưng summary embeddings chưa có trạng thái pending/version/reconcile.
 - Re-index file xóa summary nhưng reconcile không add lại; retrieval còn bỏ qua kind `summary`, nên index này vừa không được dùng vừa có thể stale/orphan. Cần generation-aware summary state và test delete→recreate/summarize concurrency.
@@ -74,11 +72,11 @@ roots_canon_v2, normcase dedup, overview invalidation và cleanup intent cùng t
 
 Atomic clear, SQL scope filter, forced collection fence và generation guard cho vector mới đã đạt. Các lỗi còn lại:
 
-- DB thật trước startup vẫn là 29 files, **7 gen0/vector_ok=1**, marker `legacy_gen_norm` chưa tồn tại. init sẽ mark pending, nhưng code hiện re-embed lại bằng gen0 rồi set ok=1; phải sửa generation allocation trước khi smoke restart.
-- Chroma trước vòng này có 9 vectors thiếu generation; SQLite marker không tự normalize Chroma, startup chỉ reconcile active project. Cần inventory/migration job cho tất cả project và trạng thái tiến độ.
+- `upsert_file()` và `reserve_file_generation()` chỉ lấy `meta.vec_gen_seq + 1`, không đối chiếu `MAX(files.vector_gen)` hoặc `MAX(vector_tombstones.generation)`. Sau restore/import/migration làm mất hoặc làm stale meta, generation mới có thể tụt (ví dụ file/tombstone cũ gen 50–100 nhưng lần ghi mới nhận gen 1); tombstone cũ với điều kiện `$lte` khi đó có thể xóa nhầm vector mới. Phải reserve atomically từ `max(meta sequence, max file generation, max tombstone generation) + 1`, repair invariant trong migration/startup, và thêm regression test DB có high generation nhưng meta thiếu/thấp.
+- Chroma trước vòng này có 9 vectors thiếu generation; SQLite marker không tự normalize Chroma. Startup đã reconcile mọi project nhưng chưa có inventory/migration job đối chiếu DB↔Chroma và trạng thái tiến độ.
 - Summary generation query đã sửa, nhưng DB summary vẫn không có pending/version state và summarizer race với re-index/delete chưa được bảo vệ.
 - Viết integration test bằng Chroma thật cho missing-field + `$lte`, delete→recreate, summary delete và canonical cleanup; fake collection chỉ xác nhận shape where, không xác nhận match/delete semantics. Codex smoke `$lte` trên collection local không hoàn tất trong >30s, cần kiểm tra timeout/performance/lock thay vì để cleanup treo INDEX_LOCK.
-- Scheduler đã recurring, nhưng shutdown/cancel chưa an toàn khi cleanup bị block. Codex repro: stop(timeout) trả khi thread cũ vẫn alive, `_cleanup_thread=None`, rồi start tạo thread thứ hai. Không được xóa reference nếu thread còn sống; start phải khóa/không tạo duplicate; expose stuck state.
+- Scheduler recurring đã giữ reference khi stop timeout, không tạo duplicate và health đã expose thread còn sống; tuy nhiên health chưa phân biệt healthy/running với stuck.
 - Chroma operation hiện không có timeout/cancel và từng treo >30s trong smoke; Event chỉ dừng giữa các vòng, không dừng call đang giữ INDEX_LOCK. Cần bounded timeout/process isolation hoặc cooperative cancellation trước khi tuyên bố shutdown sạch.
 - Backoff chưa jitter/updated_at; UI chưa có pending/retry action.
 - Acceptance: sau migration/restart không còn file/vector generation-unknown; mọi delete ack phải chứng minh target cũ đã absent và không xóa generation mới; DB/vector inventory khớp trên mọi project.
@@ -178,7 +176,7 @@ Atomic clear, SQL scope filter, forced collection fence và generation guard cho
 Python và multi-project wording đã sửa. Còn:
 
 - Roadmap vẫn đánh dấu Phase 1–3 hoàn tất dù active tasks còn nhiều.
-- Tests section chưa phản ánh 67 tests và coverage multi-project/migration/vector mới.
+- Tests section chưa phản ánh 69 tests và coverage multi-project/migration/vector mới.
 - Bổ sung schema migration, degraded semantics, health, project lifecycle và giới hạn hiện tại.
 
 ### P2-23 — UI project/explorer
@@ -240,82 +238,77 @@ Lệnh kiểm tra tối thiểu:
 ## CLAUDE_REPORT — temporary handoff
 
 <!-- CLAUDE_REPORT_START -->
-## Vòng: cấp generation thật cho legacy gen0 + scheduler shutdown an toàn (P0-5/P0-10)
+## Vòng: monotonic generation allocator + scheduler stuck-state (P0-10)
 
 ### Commit / working tree
-- Work commit: `ada1dbd` (db.py, runner.py, server.py, tests/test_reconcile.py).
+- Work commit: `d26eeae` (db.py, runner.py, server.py, tests/test_tombstones.py, tests/test_reconcile.py).
 - Report commit: chính commit chứa thay đổi workspace.md này.
 - Working tree sau report commit: clean (chỉ còn data/ gitignored). Không push.
 
 ### Task ID đã xử lý
-- **P0-5** — Codex repro: reconcile re-embed legacy `vector_gen=0` bằng `generation=0` rồi set
-  `vector_ok=1` → file legacy không bao giờ normalize thành gen>0 dù reconcile mọi project.
-- **P0-10** — Codex repro: `stop(timeout)` trả khi thread cũ vẫn alive, `_cleanup_thread=None`,
-  rồi `start` tạo thread thứ hai (duplicate).
+- **P0-10 (headline)** — Codex repro: `upsert_file()`/`reserve_file_generation()` chỉ lấy
+  `meta.vec_gen_seq + 1`, không đối chiếu `MAX(files.vector_gen)`/`MAX(vector_tombstones.generation)`.
+  Sau restore/import làm mất/stale meta, gen mới có thể tụt (file cũ gen 90 nhưng ghi mới nhận gen 1)
+  → tombstone `$lte` cũ xóa nhầm vector mới.
+- **P0-10** — health chưa phân biệt healthy/running với stuck.
 
 ### File / schema / API đã đổi
 - `codemem/storage/db.py`:
-  - **`reserve_file_generation(path, project_id) -> gen`**: bump `vec_gen_seq` toàn cục + gán cho
-    file (atomic, 1 transaction). Trả generation mới (>0).
-  - **`set_vector_ok_if_gen(path, project_id, generation) -> bool`**: set `vector_ok=1` CHỈ khi
-    `files.vector_gen == generation` (vector vừa ghi vẫn là mới nhất) → không đánh dấu OK cho vector
-    cũ khi đã có re-index gen cao hơn.
+  - **`_next_generation(conn)`**: cấp generation MONOTONIC =
+    `max(meta.vec_gen_seq, MAX(files.vector_gen), MAX(vector_tombstones.generation)) + 1`, ghi lại
+    meta; chạy trong transaction của caller (dùng conn truyền vào). `upsert_file` và
+    `reserve_file_generation` đều dùng hàm này (thay vì `meta+1` thuần).
+  - `init_db`: thêm bước repair invariant `meta.vec_gen_seq >= max(file gen, tombstone gen)` lúc
+    startup/migration (chống tụt gen sau restore/import).
 - `codemem/indexer/runner.py`:
-  - `reconcile_vectors`: với file pending có `vector_gen` falsy (legacy 0) → `reserve_file_generation`
-    cấp gen thật TRƯỚC `vectors.index_file(generation=gen)`; thành công → `set_vector_ok_if_gen`,
-    thất bại → `set_vector_ok(False)` giữ pending. (`index_file` tự ungated-delete vector gen0 cũ
-    trước khi add → không orphan.)
-  - Scheduler: thêm `_cleanup_lock`. `start_cleanup_scheduler` khóa + KHÔNG tạo thread thứ hai khi
-    thread cũ còn sống (kể cả stuck). `stop_cleanup_scheduler` trả `True` chỉ khi thread đã chết;
-    join timeout mà thread còn sống → GIỮ reference + trả `False` (stuck). Thêm
-    **`cleanup_scheduler_running()`**.
+  - Scheduler: thêm heartbeat `_cleanup_beat` (`time.monotonic()`) + `_cleanup_busy` quanh
+    `cleanup_worker`. **`cleanup_scheduler_status(stuck_after=120)`** trả
+    `{running, busy, stuck, busy_age}`; `stuck = thread sống AND busy AND busy_age >= stuck_after`.
+    Giữ `cleanup_scheduler_running()`.
 - `codemem/api/server.py`:
-  - `/api/health` thêm field `"cleanup_scheduler"` (scheduler còn sống?) — expose stuck/running state.
-- Không đổi schema/SCHEMA_VERSION. Không thêm/đổi route (vẫn 26).
+  - `/api/health` field `cleanup_scheduler` đổi từ boolean → dict `cleanup_scheduler_status()`
+    (running/busy/stuck/busy_age).
+- Không đổi schema/SCHEMA_VERSION; không thêm/đổi route (vẫn 26).
 
 ### Lệnh test + kết quả
-- `PYTHONPATH=. PYTHONUTF8=1 python -m pytest tests -q` → **69 passed** (67 baseline + 2 mới;
-  2 test reconcile cũ cập nhật cho đường gen-aware).
+- `PYTHONPATH=. PYTHONUTF8=1 python -m pytest tests -q` → **72 passed** (69 baseline + 3 mới).
 - `python -m compileall -q codemem` → pass.
 - `node --check web/app.js` → pass.
-- Test (tests/test_reconcile.py):
-  - `test_reconcile_legacy_gen0_allocates_real_generation` — DB thật (tmp): file gen0 → reconcile →
-    `index_file` nhận generation≥1, `file_vector_state == (gen, 1)`.
-  - `test_cleanup_scheduler_stop_keeps_reference_when_stuck` — worker block: `stop(timeout=0.1)`→False,
-    `_cleanup_thread` vẫn còn, `start` trả đúng thread cũ (không duplicate); release → `stop`→True →
-    `_cleanup_thread is None`.
-  - Cập nhật `test_reconcile_repairs_pending` (set OK theo gen có sẵn, không reserve) và
-    `test_reconcile_still_pending_on_failure` (thêm vector_gen) cho đường mới.
+- Test mới:
+  - `tests/test_tombstones.py::test_generation_monotonic_after_stale_meta` — file gen 90 + tombstone
+    gen 75 + meta vec_gen_seq bị xóa → `upsert_file` trả gen > 90; `reserve_file_generation` > gen đó.
+  - `tests/test_tombstones.py::test_init_repairs_generation_invariant` — file gen 120 + meta='3' (stale)
+    → sau `init_db`, `vec_gen_seq >= 120`.
+  - `tests/test_reconcile.py::test_cleanup_scheduler_status_detects_stuck` — worker block:
+    `status(stuck_after=0)` → running/busy/stuck=True; `status(stuck_after=120)` → stuck=False; sau
+    release+stop → running=False.
 
 ### Smoke / integration evidence (BẢN COPY data/code_index.db thật, non-destructive)
-- Trước: **5** file `vector_gen=0` / `vector_ok=0` (sau init mark pending; DB thật đã đổi từ 7→5 so
-  với lần Codex đọc). Reconcile (stub `index_file=True` để cô lập phần DB, không cần Chroma/Ollama):
-  `repaired=5` → sau đó **legacy gen0 = 0**, pending = 0, `MAX(vector_gen)=100`. Chứng minh phần
-  allocation generation + normalize DB chạy đúng end-to-end trên dữ liệu legacy thật.
-- Import smoke gián tiếp qua pytest (server import sạch ở vòng trước; chỉ thêm 1 field health + 1
-  import lazy trong health).
+- `init_db` trên copy: `vec_gen_seq=95`, `MAX(file gen)=93`, `MAX(tomb gen)=0` → invariant đã đúng.
+- Giả lập restore staleify meta (`vec_gen_seq='2'`) + re-init → repair về `93` (>= max file gen).
+- `upsert_file` sau đó → gen `94` (> MAX file gen 93) → monotonic xác nhận trên dữ liệu thật.
+- Bản copy đã xóa; DB thật không bị chạm.
 
 ### Partial / còn thiếu (KHÔNG hoàn thành vòng này — vẫn mở trong ACTIVE TASKS)
-- **P0-10 — smoke restart với Ollama LIVE** chứng minh vector metadata trong Chroma thật về gen>0
-  (9 vector thiếu generation) trên MỌI project: CHƯA. Smoke vòng này stub `index_file` nên chỉ chứng
-  minh phía SQLite; phần ghi metadata Chroma thật chưa chạy với embedding online.
-- **P0-10 — Chroma op không có timeout/cancel; Event chỉ dừng GIỮA các vòng**, call Chroma đang chạy
-  (giữ INDEX_LOCK) vẫn phải xong: stuck-detection đã có (stop trả False, health expose), NHƯNG bounded
-  timeout / process isolation / cooperative cancellation cho chính call Chroma thì CHƯA.
-- **P0-10 — inventory/migration job đối chiếu Chroma cho mọi project + progress state**: CHƯA.
+- **P0-10 — bounded timeout/cancel cho call Chroma đang treo**: status mới chỉ PHÁT HIỆN stuck
+  (health), Event vẫn chỉ dừng giữa các vòng; call Chroma đang giữ INDEX_LOCK vẫn phải chạy xong.
+  Cooperative cancellation / process isolation CHƯA.
+- **P0-10 — inventory/migration job đối chiếu DB↔Chroma cho mọi project + progress state**: CHƯA.
 - **P0-10 — integration test bằng Chroma THẬT** (missing-field + `$lte`, delete→recreate, summary
   delete) + điều tra `$lte` >30s: CHƯA (vẫn fake/monkeypatch).
+- **P0-10 — smoke restart với Ollama LIVE** ghi metadata gen vào Chroma thật (9 vector thiếu
+  generation): CHƯA (smoke vẫn stub vector write).
 - **P0-10 — backoff jitter/updated_at; UI pending/retry**: CHƯA.
 - **P0-5 — summary pending/version/reconcile state; retrieval kind `summary`; reconcile add lại
   summary; collection generation theo embed-model/dimension**: CHƯA.
 - **P0-8 — files_new DDL recovery/ledger; migration version/ledger + backup/rollback**: CHƯA.
 - **P0-6 — re-check generation/project-existence sau INDEX_LOCK; summarizer trong lock**: CHƯA.
-- **P1-19 — FastAPI lifespan** (hiện dùng `@app.on_event("shutdown")`): CHƯA.
+- **P1-19 — FastAPI lifespan** (hiện `@app.on_event`): CHƯA.
 
 ### Regression / phát hiện mới
-- Không phát hiện regression mới. 69/69 xanh.
-- Lưu ý reviewer: `reserve_file_generation` + `index_file` + `set_vector_ok_if_gen` chạy trong
-  `reconcile_vectors` (`@_locked` INDEX_LOCK) nên không interleave với `_index_one`/upsert; điều kiện
-  `set_vector_ok_if_gen` là guard thừa-an-toàn cho trường hợp có đường bump gen khác. Stuck-detection
-  mới chỉ phát hiện + chống duplicate; KHÔNG hủy được call Chroma đang treo (đã ghi ở phần còn thiếu).
+- Không phát hiện regression mới. 72/72 xanh.
+- Lưu ý reviewer: `_next_generation` đọc-MAX-rồi-ghi trong cùng `conn` của caller; an toàn nhờ
+  INDEX_LOCK serialize ghi ở mức app + MAX-based nên đúng cả khi meta lệch. `stuck` dùng
+  `busy_age >= stuck_after` (không phải `>`) vì `time.monotonic()` trên máy này phân giải ~1ms, đọc
+  ngay sau heartbeat có thể cho age 0.0; ngưỡng mặc định health là 120s nên không ảnh hưởng thực tế.
 <!-- CLAUDE_REPORT_END -->
