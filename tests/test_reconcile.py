@@ -143,6 +143,55 @@ def test_file_vector_state_reflects_db(tmp_path, monkeypatch):
     assert db.file_vector_state("/r/x.py", pid) == (g, 1)      # vector hoan tat
 
 
+def test_reconcile_all_projects_covers_every_project(monkeypatch):
+    # #P0-5/#P0-10: reconcile MOI project (khong chi active); collection-scope chi xu ly 1 lan
+    monkeypatch.setattr(runner, "ensure_embed_current", lambda: False)
+    monkeypatch.setattr(runner.db, "list_projects", lambda: [{"id": 1}, {"id": 2}, {"id": 3}])
+    seen = []
+
+    def fake_reconcile(pid, progress=None, include_collection=True):
+        seen.append((pid, include_collection))
+        return {"repaired": 1, "pending": 0, "tombstones_cleared": 2}
+    monkeypatch.setattr(runner, "reconcile_vectors", fake_reconcile)
+    res = runner.reconcile_all_projects()
+    assert [s[0] for s in seen] == [1, 2, 3]                       # tat ca project
+    assert seen[0][1] is True and seen[1][1] is False and seen[2][1] is False  # collection 1 lan
+    assert res["projects"] == 3 and res["repaired"] == 3 and res["tombstones_cleared"] == 6
+
+
+def test_reconcile_all_projects_empty_runs_global_cleanup(monkeypatch):
+    # #P0-10: khong co project -> van xu ly collection/global intent con ton (vd sau clear)
+    monkeypatch.setattr(runner, "ensure_embed_current", lambda: False)
+    monkeypatch.setattr(runner.db, "list_projects", lambda: [])
+    monkeypatch.setattr(runner, "_retry_tombstones", lambda *a, **k: 4)
+    res = runner.reconcile_all_projects()
+    assert res["projects"] == 0 and res["tombstones_cleared"] == 4
+
+
+def test_cleanup_scheduler_runs_repeatedly_then_stops(monkeypatch):
+    # #P0-10: scheduler chay cleanup_worker lap lai (khac one-shot truoc day) + stop sach
+    import threading
+    import time
+    calls = {"n": 0}
+    done = threading.Event()
+
+    def fake_worker(batch=50):
+        calls["n"] += 1
+        if calls["n"] >= 3:
+            done.set()
+        return 0
+    monkeypatch.setattr(runner, "cleanup_worker", fake_worker)
+    runner.start_cleanup_scheduler(interval=0.01, batch=5)
+    try:
+        assert done.wait(2.0)                  # chay >=3 lan -> dung la recurring
+    finally:
+        runner.stop_cleanup_scheduler()
+    assert runner._cleanup_thread is None      # stop sach
+    n_after = calls["n"]
+    time.sleep(0.05)
+    assert calls["n"] == n_after               # da dung han, khong tang nua
+
+
 def test_ensure_embed_current_marks_stale(tmp_path, monkeypatch):
     # #P0-5: doi embedding model -> mark moi vector stale; goi lai -> no-op
     import codemem.storage.db as db

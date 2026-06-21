@@ -91,6 +91,63 @@ def cleanup_worker(batch=50):
     return _retry_tombstones(batch=batch)
 
 
+# Recurring cleanup scheduler (#P0-10): cleanup_worker truoc day chi chay 1 lan luc startup ->
+# intent dang backoff khong tu chay khi den han. Scheduler lap lai theo interval, co shutdown sach.
+_cleanup_stop = threading.Event()
+_cleanup_thread = None
+
+
+def start_cleanup_scheduler(interval=60, batch=50):
+    """Chay cleanup_worker lap lai moi `interval` giay cho den khi stop. Intent backoff se duoc
+    retry khi den han (next_retry <= now). Idempotent: dang chay -> tra thread hien tai (#P0-10)."""
+    global _cleanup_thread
+    if _cleanup_thread is not None and _cleanup_thread.is_alive():
+        return _cleanup_thread
+    _cleanup_stop.clear()
+
+    def _loop():
+        while not _cleanup_stop.is_set():
+            try:
+                cleanup_worker(batch=batch)
+            except Exception as e:
+                print(f"[warn] cleanup scheduler: {e}")
+            _cleanup_stop.wait(interval)       # ngu interval; thoat ngay khi stop duoc set
+    _cleanup_thread = threading.Thread(target=_loop, daemon=True)
+    _cleanup_thread.start()
+    return _cleanup_thread
+
+
+def stop_cleanup_scheduler(timeout=5):
+    """Dung scheduler sach (shutdown/cancel)."""
+    global _cleanup_thread
+    _cleanup_stop.set()
+    t = _cleanup_thread
+    if t is not None:
+        t.join(timeout=timeout)
+        _cleanup_thread = None
+
+
+@_locked
+def reconcile_all_projects(progress=None, include_collection=True):
+    """Reconcile vector cho MOI project (khong chi active) - #P0-5/#P0-10.
+    Truoc day startup chi reconcile active -> project khac (vector_ok=0, legacy gen0) khong duoc
+    repair den khi switch toi. collection-scope chi xu ly 1 lan (project dau) de khong wipe lap."""
+    ensure_embed_current()
+    totals = {"projects": 0, "repaired": 0, "pending": 0, "tombstones_cleared": 0}
+    first = include_collection
+    for p in db.list_projects():
+        rec = reconcile_vectors(p["id"], progress, include_collection=first)
+        first = False
+        totals["projects"] += 1
+        totals["repaired"] += rec["repaired"]
+        totals["pending"] += rec["pending"]
+        totals["tombstones_cleared"] += rec["tombstones_cleared"]
+    # Khong co project nao -> van xu ly collection/global intent con ton (vd sau clear)
+    if totals["projects"] == 0 and include_collection:
+        totals["tombstones_cleared"] += _retry_tombstones()
+    return totals
+
+
 @_locked
 def reconcile_vectors(pid, progress=None, include_collection=True):
     """Repair vector pending/thieu + retry tombstone (#P0-5/#P0-10).

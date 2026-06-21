@@ -243,21 +243,33 @@ def clear_index():
 app.mount("/", StaticFiles(directory=str(WEB_DIR), html=True), name="web")
 
 
+@app.on_event("shutdown")
+def _shutdown():
+    """Dung scheduler + watcher sach khi tat (#P0-10 shutdown/cancel)."""
+    from ..indexer.runner import stop_cleanup_scheduler
+    stop_cleanup_scheduler()
+    try:
+        watcher.stop()
+    except Exception:
+        pass
+
+
 def main():
     import uvicorn
     db.init_db()
     # Neu da tung index project va path con ton tai -> bat watcher (tranh crash startup)
     import threading
-    from ..indexer.runner import reconcile_vectors, cleanup_worker
+    from ..indexer.runner import reconcile_all_projects, start_cleanup_scheduler
     p = db.get_active_project()
     if p and os.path.isdir(p["root"]):
         try:
             watcher.start(p["root"], project_id=p["id"])
         except Exception as e:
             print(f"[warn] khong bat duoc watcher: {e}")
-        threading.Thread(target=lambda: reconcile_vectors(p["id"]), daemon=True).start()
-    # Cleanup worker doc lap project (xu ly intent ke ca khi khong co active project) - #P0-10
-    threading.Thread(target=cleanup_worker, daemon=True).start()
+    # Reconcile MOI project (khong chi active) o nen - #P0-5/#P0-10
+    threading.Thread(target=lambda: reconcile_all_projects(), daemon=True).start()
+    # Recurring cleanup scheduler (intent backoff duoc retry khi den han) - #P0-10
+    start_cleanup_scheduler()
     print(f"code-memory chay tai http://{HOST}:{PORT}")
     uvicorn.run(app, host=HOST, port=PORT)
 
