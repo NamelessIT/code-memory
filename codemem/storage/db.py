@@ -121,22 +121,24 @@ def init_db():
         except sqlite3.OperationalError:
             pass
 
-    # Migrate files PK path-global (cu) -> composite (project_id, path) cho nested project
+    # Migrate files PK path-global (cu) -> composite (project_id, path). ATOMIC (conn.execute trong
+    # transaction init_db, KHONG executescript). files_new PHAI gom vector_ok + vector_gen (#P0-8 regression).
     fcols = [r["name"] for r in conn.execute("PRAGMA table_info(files)")]
     if "id" not in fcols:
-        conn.executescript("""
+        conn.execute("""
             CREATE TABLE files_new (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 project_id INTEGER, path TEXT,
                 lang TEXT, hash TEXT, skeleton TEXT, indexed_at TEXT, summary TEXT DEFAULT '',
-                vector_ok INTEGER DEFAULT 1,
+                vector_ok INTEGER DEFAULT 1, vector_gen INTEGER DEFAULT 0,
                 UNIQUE(project_id, path)
-            );
-            INSERT INTO files_new(project_id, path, lang, hash, skeleton, indexed_at, summary)
-                SELECT project_id, path, lang, hash, skeleton, indexed_at, COALESCE(summary,'') FROM files;
-            DROP TABLE files;
-            ALTER TABLE files_new RENAME TO files;
-        """)
+            )""")
+        conn.execute(
+            "INSERT INTO files_new(project_id, path, lang, hash, skeleton, indexed_at, summary, vector_ok, vector_gen) "
+            "SELECT project_id, path, lang, hash, skeleton, indexed_at, COALESCE(summary,''), "
+            "COALESCE(vector_ok,1), COALESCE(vector_gen,0) FROM files")
+        conn.execute("DROP TABLE files")
+        conn.execute("ALTER TABLE files_new RENAME TO files")
 
     # Migrate du lieu single-project cu -> 1 project
     has_proj = conn.execute("SELECT COUNT(*) c FROM projects").fetchone()["c"]
@@ -168,6 +170,21 @@ def init_db():
         conn.execute("UPDATE files SET summary=''")
         conn.execute("INSERT INTO meta(key,value) VALUES('schema_version',?) "
                      "ON CONFLICT(key) DO UPDATE SET value=?", (SCHEMA_VERSION, SCHEMA_VERSION))
+
+    # Post-migration schema assertion/repair: dam bao files co vector_gen/vector_ok (#P0-8)
+    fcols2 = [r["name"] for r in conn.execute("PRAGMA table_info(files)")]
+    for col, ddl in (("vector_gen", "ALTER TABLE files ADD COLUMN vector_gen INTEGER DEFAULT 0"),
+                     ("vector_ok", "ALTER TABLE files ADD COLUMN vector_ok INTEGER DEFAULT 1")):
+        if col not in fcols2:
+            conn.execute(ddl)
+
+    # Normalize legacy: file vector_gen=0 (index truoc khi co generation) -> mark pending de re-embed
+    # voi generation that. Tranh vector generation-unknown + delete-orphan (#P0-10/#P0-5). Chay 1 lan.
+    lg = conn.execute("SELECT value FROM meta WHERE key='legacy_gen_norm'").fetchone()
+    if not lg or lg["value"] != "1":
+        conn.execute("UPDATE files SET vector_ok=0 WHERE COALESCE(vector_gen,0)=0")
+        conn.execute("INSERT INTO meta(key,value) VALUES('legacy_gen_norm','1') "
+                     "ON CONFLICT(key) DO UPDATE SET value='1'")
     conn.commit()
     conn.close()
 

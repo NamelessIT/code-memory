@@ -78,7 +78,8 @@ def run_summarize(make_overview=True):
             summ = summarize_file(f["skeleton"] or "")
             if summ:                       # chi luu summary hop le
                 db.set_file_summary(f["path"], summ, project_id=pid)
-                vectors.index_summary(f["path"], f["lang"], summ, project_id=pid)
+                vectors.index_summary(f["path"], f["lang"], summ, project_id=pid,
+                                      generation=f.get("vector_gen", 0))
             else:
                 progress["errors"] += 1
             progress["done"] += 1

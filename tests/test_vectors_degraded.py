@@ -66,6 +66,17 @@ def test_delete_file_with_generation_filter(monkeypatch):
     assert {"generation": {"$lte": 5}} in conds and {"project_id": 2} in conds
 
 
+def test_delete_file_generation_zero_no_gate(monkeypatch):
+    # #P0-10 legacy: generation=0 (vector legacy khong co field 'generation') -> KHONG gate $lte
+    # -> xoa het, tranh orphan-but-acked. Chi gate khi gen>=1.
+    fc = _FakeCol()
+    monkeypatch.setattr(vec, "_client", lambda: _FakeClient(fc))
+    vec.delete_file("/p/x.py", project_id=2, generation=0)
+    conds = fc.deleted[0]["$and"]
+    assert {"file_path": "/p/x.py"} in conds and {"project_id": 2} in conds
+    assert all("generation" not in c for c in conds)   # khong co dieu kien generation
+
+
 def test_delete_unavailable_returns_false(monkeypatch):
     # #P0-10: client khong mo duoc -> KHONG dam bao da xoa -> False
     monkeypatch.setattr(vec, "_client", lambda: None)

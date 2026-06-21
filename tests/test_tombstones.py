@@ -118,6 +118,42 @@ def test_interrupted_migration_recovery(tmp_path, monkeypatch):
     assert "vector_tombstones_v1" not in tbls       # da drop
 
 
+def test_legacy_pathpk_db_migrates_then_upsert_works(tmp_path, monkeypatch):
+    # #P0-8 regression: DB files path-PK cu (khong co vector_gen) -> init_db migrate xong upsert KHONG loi
+    import sqlite3
+    p = tmp_path / "legacy.db"
+    monkeypatch.setattr(db, "DB_PATH", p)
+    c = sqlite3.connect(str(p))
+    c.execute("CREATE TABLE files (path TEXT PRIMARY KEY, project_id INTEGER, lang TEXT, "
+              "hash TEXT, skeleton TEXT, indexed_at TEXT)")
+    c.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+    c.execute("INSERT INTO files(path,project_id,lang,hash,skeleton,indexed_at) "
+              "VALUES ('/r/x.py',1,'python','h','s','t')")
+    c.commit(); c.close()
+    db.init_db()                                   # migrate path-PK -> composite (phai gom vector_gen)
+    cc = db._conn()
+    cols = [r["name"] for r in cc.execute("PRAGMA table_info(files)")]
+    cc.close()
+    assert "vector_gen" in cols and "id" in cols
+    pid = db.get_or_create_project("/r2", "R2")
+    g = db.upsert_file("/r2/y.py", "python", "h2", "s", [], project_id=pid)   # khong OperationalError
+    assert g >= 1
+
+
+def test_legacy_gen_norm_marks_pending(tmp_path, monkeypatch):
+    # #P0-10/#P0-5: file vector_gen=0 (legacy) -> normalize mark vector_ok=0 de re-embed gen that
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "n.db")
+    db.init_db()
+    pid = db.get_or_create_project("/r", "R")
+    conn = db._conn()
+    conn.execute("INSERT INTO files(project_id,path,lang,hash,skeleton,indexed_at,summary,vector_ok,vector_gen) "
+                 "VALUES (?,?,?,?,?,?,?,1,0)", (pid, "/r/x.py", "python", "h", "s", "t", ""))
+    conn.execute("DELETE FROM meta WHERE key='legacy_gen_norm'")
+    conn.commit(); conn.close()
+    db.init_db()                                   # rerun normalize
+    assert len(db.files_pending_vector(pid)) == 1   # gen=0 -> vector_ok=0
+
+
 def test_schema_v1_upgrade_preserves_rows(tmp_path, monkeypatch):
     # #P0-10: nang cap bang tombstone v1 -> v2 GIU LAI row pending (Codex repro 1->1, khong mat)
     import sqlite3

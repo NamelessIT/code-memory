@@ -120,7 +120,7 @@ def delete_file(path, project_id=None, generation=None):
     conds = [{"file_path": path}]
     if project_id is not None:
         conds.append({"project_id": project_id})
-    if generation is not None:
+    if generation:                          # CHI gate khi gen>=1; gen 0/None (legacy) -> xoa het, khong orphan
         conds.append({"generation": {"$lte": generation}})
     where = conds[0] if len(conds) == 1 else {"$and": conds}
     return _delete_where(where)
@@ -181,7 +181,7 @@ def index_file(path, lang, skeleton, symbols, project_id=None, generation=0):
         return False
 
 
-def index_summary(path, lang, summary, project_id=None):
+def index_summary(path, lang, summary, project_id=None, generation=0):
     col = get_collection()
     if col is None or not summary:
         return
@@ -190,7 +190,7 @@ def index_summary(path, lang, summary, project_id=None):
         col.delete(ids=[sid])
         col.add(documents=[summary],
                 metadatas=[{"file_path": path, "lang": lang, "kind": "summary",
-                            "name": path, "project_id": project_id}],
+                            "name": path, "project_id": project_id, "generation": generation}],
                 ids=[sid])
     except Exception as e:
         print(f"[warn] vector index_summary loi: {e}")
