@@ -115,6 +115,32 @@ def test_canonical_root_merge_migration(tmp_path, monkeypatch):
     assert db.get_overview(pid) == ""              # #P0-8: overview cu bi invalidate khi merge
 
 
+def test_canonical_migration_carries_generation_into_tombstone(tmp_path, monkeypatch):
+    # #P0-8: file tombstone tu canonical migration mang vector_gen cua vector cu (KHONG default 0)
+    # -> retry chi xoa vector gen <= do, khong xoa vector moi sau re-index.
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "cg.db")
+    db.init_db()
+    conn = db._conn()
+    conn.execute("INSERT INTO projects(root,name,created_at,last_indexed_at) VALUES ('C:\\Repo\\App','App','t','t')")
+    conn.execute("INSERT INTO projects(root,name,created_at,last_indexed_at) VALUES ('c:\\repo\\app','app','t','t')")
+    p1 = conn.execute("SELECT id FROM projects WHERE root='C:\\Repo\\App'").fetchone()["id"]
+    p2 = conn.execute("SELECT id FROM projects WHERE root='c:\\repo\\app'").fetchone()["id"]
+    conn.execute("INSERT INTO files(project_id,path,lang,hash,skeleton,indexed_at,summary,vector_ok,vector_gen) "
+                 "VALUES (?,?,?,?,?,?,?,1,11)", (p1, "C:\\Repo\\App\\x.py", "python", "h1", "s1", "2026-01-01", ""))
+    conn.execute("INSERT INTO files(project_id,path,lang,hash,skeleton,indexed_at,summary,vector_ok,vector_gen) "
+                 "VALUES (?,?,?,?,?,?,?,1,22)", (p2, "c:\\repo\\app\\x.py", "python", "h2", "s2", "2026-02-01", ""))
+    conn.execute("DELETE FROM meta WHERE key='roots_canon_v2'")
+    conn.commit()
+    conn.close()
+
+    db.init_db()                                   # trigger _migrate_canonical_roots
+
+    tombs = {(t["project_id"], t["file_path"]): t["generation"]
+             for t in db.due_tombstones() if t["scope"] == "file"}
+    assert tombs.get((p1, "C:\\Repo\\App\\x.py")) == 11   # loser bi xoa -> gen vector cu
+    assert tombs.get((p2, "c:\\repo\\app\\x.py")) == 22   # survivor move -> gen vector cu
+
+
 def test_indexed_hashes_scoped(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "t2.db")
     db.init_db()

@@ -60,6 +60,35 @@ def test_retry_tombstones_backoff_on_failure(monkeypatch):
     assert failed == [1]
 
 
+def test_retry_legacy_gen0_stale_when_file_recreated(monkeypatch):
+    # #P0-10 race: intent legacy gen=0 nhung file da re-index (gen>0) -> ack stale,
+    # KHONG ungated-delete (re-index da don vector cu) de tranh xoa nham vector moi.
+    monkeypatch.setattr(runner.db, "due_tombstones",
+                        lambda batch=50, scopes=None: [{"id": 1, "scope": "file", "project_id": 2,
+                                                        "file_path": "/p/a.py", "generation": 0}])
+    monkeypatch.setattr(runner.db, "file_current_gen", lambda path, pid: 7)   # file ton tai lai, gen 7
+    called = []
+    monkeypatch.setattr(runner.vectors, "delete_file", lambda *a, **k: called.append(1) or True)
+    deleted = []
+    monkeypatch.setattr(runner.db, "del_tombstone", lambda tid: deleted.append(tid))
+    assert runner._retry_tombstones() == 1
+    assert deleted == [1] and called == []           # stale -> ack, KHONG goi vector delete
+
+
+def test_retry_legacy_gen0_deletes_when_file_absent(monkeypatch):
+    # #P0-10: intent legacy gen=0, file da xoa han (None) -> ungated delete (don orphan)
+    monkeypatch.setattr(runner.db, "due_tombstones",
+                        lambda batch=50, scopes=None: [{"id": 1, "scope": "file", "project_id": 2,
+                                                        "file_path": "/p/a.py", "generation": 0}])
+    monkeypatch.setattr(runner.db, "file_current_gen", lambda path, pid: None)  # file da xoa
+    seen = {}
+    monkeypatch.setattr(runner.vectors, "delete_file",
+                        lambda p, project_id=None, generation=None: seen.update({"gen": generation}) or True)
+    monkeypatch.setattr(runner.db, "del_tombstone", lambda tid: None)
+    assert runner._retry_tombstones() == 1
+    assert seen["gen"] == 0                           # ungated (gen falsy) van chay khi file absent
+
+
 def test_cleanup_worker_independent_of_project(monkeypatch):
     # #P0-10: cleanup_worker retry moi scope, KHONG can active project
     monkeypatch.setattr(runner.db, "due_tombstones",

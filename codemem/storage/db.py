@@ -209,7 +209,7 @@ def _migrate_canonical_roots(conn):
     import os
     rows = conn.execute("SELECT id, root FROM projects ORDER BY id").fetchall()
     active = _active_pid(conn)
-    vec_cleanup = []     # (project_id, path) vector cu can xoa
+    vec_cleanup = []     # (project_id, path, generation) vector cu can xoa
     dup_pids = []
 
     groups = {}
@@ -224,30 +224,31 @@ def _migrate_canonical_roots(conn):
     for canon, ids in groups.items():
         keep = ids[0]
         group_changed = len(ids) > 1     # co dup project -> chac chan merge
-        # Gom tat ca file trong nhom (moi project id)
+        # Gom tat ca file trong nhom (moi project id); giu vector_gen de carry vao intent (#P0-8)
         files = []
         for pidx in ids:
-            for f in conn.execute("SELECT path, indexed_at FROM files WHERE project_id=?", (pidx,)).fetchall():
-                files.append((pidx, f["path"], f["indexed_at"] or ""))
+            for f in conn.execute("SELECT path, indexed_at, vector_gen FROM files WHERE project_id=?",
+                                  (pidx,)).fetchall():
+                files.append((pidx, f["path"], f["indexed_at"] or "", f["vector_gen"] or 0))
 
         # Chon survivor cho moi normcase-key (indexed_at moi nhat)
         best = {}
-        for (pidx, path, ts) in files:
+        for (pidx, path, ts, vgen) in files:
             nkey = os.path.normcase(path)
             cur = best.get(nkey)
             if cur is None or ts >= cur[2]:
-                best[nkey] = (pidx, path, ts)
+                best[nkey] = (pidx, path, ts, vgen)
         survivors = {(b[0], b[1]) for b in best.values()}
 
         # Xoa cac ban khong phai survivor
-        for (pidx, path, ts) in files:
+        for (pidx, path, ts, vgen) in files:
             if (pidx, path) not in survivors:
                 _del_file(pidx, path)
-                vec_cleanup.append((pidx, path))
+                vec_cleanup.append((pidx, path, vgen))
                 group_changed = True
 
         # Dua survivor ve (keep, nkey)
-        for nkey, (pidx, path, ts) in best.items():
+        for nkey, (pidx, path, ts, vgen) in best.items():
             if (pidx, path) == (keep, nkey):
                 continue
             for t in ("symbols", "edges", "routes"):
@@ -255,7 +256,7 @@ def _migrate_canonical_roots(conn):
                              (keep, nkey, pidx, path))
             conn.execute("UPDATE files SET project_id=?, path=?, vector_ok=0 WHERE project_id=? AND path=?",
                          (keep, nkey, pidx, path))
-            vec_cleanup.append((pidx, path))      # vector ID cu (pidx, path) khac (keep, nkey)
+            vec_cleanup.append((pidx, path, vgen))   # vector ID cu (pidx, path) khac (keep, nkey)
             group_changed = True
 
         # Xoa cac dup project + overview
@@ -280,8 +281,8 @@ def _migrate_canonical_roots(conn):
 
     # Ghi cleanup intent (tombstone) trong CUNG transaction migration -> durable, worker retry sau.
     # KHONG goi Chroma o day (side-effect khong ben trong transaction) - #P0-8/#P0-10.
-    items = [("project", dp, "") for dp in dup_pids] + \
-            [("file", pidx, path) for (pidx, path) in vec_cleanup]
+    items = [("project", dp, "", 0) for dp in dup_pids] + \
+            [("file", pidx, path, vgen) for (pidx, path, vgen) in vec_cleanup]
     if items:
         add_tombstones_bulk(conn, items)
 
@@ -504,12 +505,21 @@ def add_tombstone(scope, project_id=0, file_path=""):
 
 
 def add_tombstones_bulk(conn, items):
-    """Ghi nhieu tombstone trong CUNG transaction (dung trong migration). items: [(scope,pid,path)]."""
+    """Ghi nhieu tombstone trong CUNG transaction (dung trong migration).
+    items: [(scope,pid,path)] hoac [(scope,pid,path,generation)] (#P0-8: carry generation
+    cua vector cu -> retry chi xoa vector gen <= do, khong xoa vector moi sau re-index)."""
     now = datetime.now().isoformat()
+    rows = []
+    for it in items:
+        s, p, fp = it[0], it[1], it[2]
+        g = it[3] if len(it) > 3 else 0
+        rows.append((s, p or 0, fp or "", now, now, g or 0))
     conn.executemany(
-        "INSERT OR IGNORE INTO vector_tombstones(scope, project_id, file_path, next_retry, created_at) "
-        "VALUES (?,?,?,?,?)",
-        [(s, p or 0, fp or "", now, now) for (s, p, fp) in items])
+        "INSERT INTO vector_tombstones(scope, project_id, file_path, next_retry, created_at, generation) "
+        "VALUES (?,?,?,?,?,?) "
+        "ON CONFLICT(scope,project_id,file_path) DO UPDATE SET "
+        "generation=MAX(generation, excluded.generation)",
+        rows)
 
 
 def due_tombstones(limit=50, scopes=None):
@@ -587,6 +597,16 @@ def files_pending_vector(project_id):
         (project_id,)).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def file_current_gen(path, project_id=None):
+    """vector_gen hien tai cua file, hoac None neu file khong con trong DB (#P0-10).
+    Dung de phat hien file da bi re-index (gen moi) truoc khi chay legacy ungated delete."""
+    conn = _conn()
+    pid = project_id if project_id is not None else _active_pid(conn)
+    row = conn.execute("SELECT vector_gen FROM files WHERE project_id=? AND path=?", (pid, path)).fetchone()
+    conn.close()
+    return (row["vector_gen"] if row else None)
 
 
 def get_project_root(pid):
@@ -767,7 +787,7 @@ def files_needing_summary(project_id=None):
     conn = _conn()
     pid = project_id if project_id is not None else _active_pid(conn)
     rows = conn.execute(
-        "SELECT path, lang, skeleton FROM files WHERE project_id=? AND COALESCE(summary,'')='' ORDER BY path",
+        "SELECT path, lang, skeleton, vector_gen FROM files WHERE project_id=? AND COALESCE(summary,'')='' ORDER BY path",
         (pid,)).fetchall()
     conn.close()
     return [dict(r) for r in rows]

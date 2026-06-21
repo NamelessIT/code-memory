@@ -154,6 +154,17 @@ def test_legacy_gen_norm_marks_pending(tmp_path, monkeypatch):
     assert len(db.files_pending_vector(pid)) == 1   # gen=0 -> vector_ok=0
 
 
+def test_files_needing_summary_includes_vector_gen(tmp_path, monkeypatch):
+    # #P0-5: summarizer ghi generation tu f["vector_gen"]; query PHAI SELECT vector_gen
+    # (truoc day thieu -> summary luon ghi generation=0).
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "s.db")
+    db.init_db()
+    pid = db.get_or_create_project("/r", "R")
+    g = db.upsert_file("/r/x.py", "python", "h", "skel", [], project_id=pid)
+    rows = db.files_needing_summary(project_id=pid)
+    assert len(rows) == 1 and rows[0]["vector_gen"] == g and g >= 1
+
+
 def test_schema_v1_upgrade_preserves_rows(tmp_path, monkeypatch):
     # #P0-10: nang cap bang tombstone v1 -> v2 GIU LAI row pending (Codex repro 1->1, khong mat)
     import sqlite3
