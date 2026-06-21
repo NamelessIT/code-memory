@@ -154,6 +154,45 @@ def test_legacy_gen_norm_marks_pending(tmp_path, monkeypatch):
     assert len(db.files_pending_vector(pid)) == 1   # gen=0 -> vector_ok=0
 
 
+def test_generation_monotonic_after_stale_meta(tmp_path, monkeypatch):
+    # #P0-10: meta.vec_gen_seq mat/thap (vd sau restore) nhung files/tombstones gen cao -> gen moi
+    # PHAI > max(file,tombstone); neu khong, tombstone $lte cu se xoa nham vector moi.
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "g.db")
+    db.init_db()
+    pid = db.get_or_create_project("/r", "R")
+    conn = db._conn()
+    conn.execute("INSERT INTO files(project_id,path,lang,hash,skeleton,indexed_at,summary,vector_ok,vector_gen) "
+                 "VALUES (?,?,?,?,?,?,?,1,90)", (pid, "/r/old.py", "python", "h", "s", "t", ""))
+    conn.execute("INSERT INTO vector_tombstones(scope,project_id,file_path,next_retry,created_at,generation) "
+                 "VALUES ('file',?,?,?,?,75)", (pid, "/r/gone.py", "t", "t"))
+    conn.execute("DELETE FROM meta WHERE key='vec_gen_seq'")          # meta mat
+    conn.commit()
+    conn.close()
+    g = db.upsert_file("/r/new.py", "python", "h2", "s", [], project_id=pid)
+    assert g > 90                                                     # khong tut duoi file gen cu
+    g2 = db.reserve_file_generation("/r/old.py", pid)
+    assert g2 > g                                                     # van monotonic
+
+
+def test_init_repairs_generation_invariant(tmp_path, monkeypatch):
+    # #P0-10: init repair meta.vec_gen_seq >= max(file gen, tombstone gen) khi meta stale/thap
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "gi.db")
+    db.init_db()
+    pid = db.get_or_create_project("/r", "R")
+    conn = db._conn()
+    conn.execute("INSERT INTO files(project_id,path,lang,hash,skeleton,indexed_at,summary,vector_ok,vector_gen) "
+                 "VALUES (?,?,?,?,?,?,?,1,120)", (pid, "/r/x.py", "python", "h", "s", "t", ""))
+    conn.execute("INSERT INTO meta(key,value) VALUES('vec_gen_seq','3') "
+                 "ON CONFLICT(key) DO UPDATE SET value='3'")          # meta thap (stale)
+    conn.commit()
+    conn.close()
+    db.init_db()                                                      # repair invariant
+    conn = db._conn()
+    seq = int(conn.execute("SELECT value FROM meta WHERE key='vec_gen_seq'").fetchone()["value"])
+    conn.close()
+    assert seq >= 120
+
+
 def test_files_needing_summary_includes_vector_gen(tmp_path, monkeypatch):
     # #P0-5: summarizer ghi generation tu f["vector_gen"]; query PHAI SELECT vector_gen
     # (truoc day thieu -> summary luon ghi generation=0).

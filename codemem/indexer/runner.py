@@ -96,6 +96,8 @@ def cleanup_worker(batch=50):
 _cleanup_stop = threading.Event()
 _cleanup_thread = None
 _cleanup_lock = threading.Lock()     # bao ve tao/xoa reference -> khong duplicate thread (#P0-10)
+_cleanup_busy = threading.Event()    # dang chay cleanup_worker (de phan biet stuck) (#P0-10)
+_cleanup_beat = [0.0]                # time (epoch) bat dau lan chay gan nhat
 
 
 def start_cleanup_scheduler(interval=60, batch=50):
@@ -109,11 +111,16 @@ def start_cleanup_scheduler(interval=60, batch=50):
         _cleanup_stop.clear()
 
         def _loop():
+            import time
             while not _cleanup_stop.is_set():
+                _cleanup_beat[0] = time.monotonic()   # monotonic: do thoi gian troi, do phan giai cao
+                _cleanup_busy.set()
                 try:
                     cleanup_worker(batch=batch)
                 except Exception as e:
                     print(f"[warn] cleanup scheduler: {e}")
+                finally:
+                    _cleanup_busy.clear()
                 _cleanup_stop.wait(interval)   # ngu interval; thoat ngay khi stop duoc set
         _cleanup_thread = threading.Thread(target=_loop, daemon=True)
         _cleanup_thread.start()
@@ -143,6 +150,19 @@ def cleanup_scheduler_running():
     """True neu scheduler thread con song (gom ca truong hop stuck) - expose cho health (#P0-10)."""
     t = _cleanup_thread
     return t is not None and t.is_alive()
+
+
+def cleanup_scheduler_status(stuck_after=120):
+    """Phan biet running/healthy vs stuck cho health (#P0-10). stuck = thread con song VA dang
+    busy (trong cleanup_worker) qua `stuck_after` giay -> nghi ngo Chroma treo, can can thiep."""
+    import time
+    t = _cleanup_thread
+    alive = t is not None and t.is_alive()
+    busy = _cleanup_busy.is_set()
+    age = (time.monotonic() - _cleanup_beat[0]) if _cleanup_beat[0] else None
+    stuck = bool(alive and busy and age is not None and age >= stuck_after)
+    return {"running": alive, "busy": busy, "stuck": stuck,
+            "busy_age": round(age, 1) if (age is not None and busy) else None}
 
 
 @_locked

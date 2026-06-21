@@ -185,6 +185,17 @@ def init_db():
         conn.execute("UPDATE files SET vector_ok=0 WHERE COALESCE(vector_gen,0)=0")
         conn.execute("INSERT INTO meta(key,value) VALUES('legacy_gen_norm','1') "
                      "ON CONFLICT(key) DO UPDATE SET value='1'")
+
+    # Repair invariant generation (#P0-10): meta.vec_gen_seq >= max(file gen, tombstone gen).
+    # Sau restore/import lam mat/stale meta, dam bao gen cap sau khong tut duoi vector cu.
+    seqrow = conn.execute("SELECT value FROM meta WHERE key='vec_gen_seq'").fetchone()
+    seq = int(seqrow["value"]) if seqrow and seqrow["value"] else 0
+    fmax = conn.execute("SELECT COALESCE(MAX(vector_gen),0) m FROM files").fetchone()["m"]
+    tmax = conn.execute("SELECT COALESCE(MAX(generation),0) m FROM vector_tombstones").fetchone()["m"]
+    want = max(seq, fmax, tmax)
+    if want != seq:
+        conn.execute("INSERT INTO meta(key,value) VALUES('vec_gen_seq',?) "
+                     "ON CONFLICT(key) DO UPDATE SET value=?", (str(want), str(want)))
     conn.commit()
     conn.close()
 
@@ -404,10 +415,7 @@ def upsert_file(path, lang, file_hash, skeleton, symbols, edges=None, routes=Non
     Tra ve generation de caller tag vector."""
     conn = _conn()
     now = datetime.now().isoformat()
-    grow = conn.execute("SELECT value FROM meta WHERE key='vec_gen_seq'").fetchone()
-    gen = (int(grow["value"]) if grow and grow["value"] else 0) + 1
-    conn.execute("INSERT INTO meta(key,value) VALUES('vec_gen_seq',?) "
-                 "ON CONFLICT(key) DO UPDATE SET value=?", (str(gen), str(gen)))
+    gen = _next_generation(conn)
     # Identity = (project_id, path) -> project long nhau khong ghi de nhau
     conn.execute(
         "INSERT INTO files(project_id, path, lang, hash, skeleton, indexed_at, summary, vector_ok, vector_gen) "
@@ -489,15 +497,27 @@ def set_vector_ok(path, ok, project_id):
     conn.close()
 
 
+def _next_generation(conn):
+    """Cap generation moi MONOTONIC: max(meta.vec_gen_seq, MAX(files.vector_gen),
+    MAX(vector_tombstones.generation)) + 1, roi ghi lai meta (#P0-10). Chong tut gen sau
+    restore/import/migration lam mat hoac stale meta (gen moi < gen vector cu -> tombstone $lte
+    xoa nham vector moi). Goi TRONG transaction cua caller (dung conn truyen vao)."""
+    row = conn.execute("SELECT value FROM meta WHERE key='vec_gen_seq'").fetchone()
+    seq = int(row["value"]) if row and row["value"] else 0
+    fmax = conn.execute("SELECT COALESCE(MAX(vector_gen),0) m FROM files").fetchone()["m"]
+    tmax = conn.execute("SELECT COALESCE(MAX(generation),0) m FROM vector_tombstones").fetchone()["m"]
+    gen = max(seq, fmax, tmax) + 1
+    conn.execute("INSERT INTO meta(key,value) VALUES('vec_gen_seq',?) "
+                 "ON CONFLICT(key) DO UPDATE SET value=?", (str(gen), str(gen)))
+    return gen
+
+
 def reserve_file_generation(path, project_id):
-    """Bump vec_gen_seq toan cuc + gan cho file (atomic). Tra ve generation moi (>0).
+    """Cap generation moi (monotonic) + gan cho file (atomic). Tra ve generation moi (>0).
     Dung khi reconcile file legacy vector_gen=0 -> cap generation that TRUOC khi ghi vector,
     de vector metadata + DB khong con gen0 (#P0-5)."""
     conn = _conn()
-    grow = conn.execute("SELECT value FROM meta WHERE key='vec_gen_seq'").fetchone()
-    gen = (int(grow["value"]) if grow and grow["value"] else 0) + 1
-    conn.execute("INSERT INTO meta(key,value) VALUES('vec_gen_seq',?) "
-                 "ON CONFLICT(key) DO UPDATE SET value=?", (str(gen), str(gen)))
+    gen = _next_generation(conn)
     conn.execute("UPDATE files SET vector_gen=? WHERE project_id=? AND path=?", (gen, project_id, path))
     conn.commit()
     conn.close()

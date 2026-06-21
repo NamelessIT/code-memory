@@ -195,6 +195,29 @@ def test_cleanup_scheduler_stop_keeps_reference_when_stuck(monkeypatch):
     assert runner._cleanup_thread is None             # dung sach sau khi worker tha
 
 
+def test_cleanup_scheduler_status_detects_stuck(monkeypatch):
+    # #P0-10: health phan biet running/healthy vs stuck (busy qua nguong)
+    import threading
+    release = threading.Event()
+    started = threading.Event()
+
+    def stuck_worker(batch=50):
+        started.set()
+        release.wait(5)
+        return 0
+    monkeypatch.setattr(runner, "cleanup_worker", stuck_worker)
+    runner.start_cleanup_scheduler(interval=0.01, batch=5)
+    try:
+        assert started.wait(2.0)
+        st = runner.cleanup_scheduler_status(stuck_after=0)        # nguong 0 + dang busy -> stuck
+        assert st["running"] is True and st["busy"] is True and st["stuck"] is True
+        assert runner.cleanup_scheduler_status(stuck_after=120)["stuck"] is False  # nguong cao
+    finally:
+        release.set()
+        runner.stop_cleanup_scheduler(timeout=2.0)
+    assert runner.cleanup_scheduler_status()["running"] is False
+
+
 def test_reconcile_all_projects_covers_every_project(monkeypatch):
     # #P0-5/#P0-10: reconcile MOI project (khong chi active); collection-scope chi xu ly 1 lan
     monkeypatch.setattr(runner, "ensure_embed_current", lambda: False)
