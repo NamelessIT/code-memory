@@ -28,11 +28,11 @@
 
 ## Baseline đã được Codex xác minh
 
-- Reviewed implementation commit: 86698c7; report commit: 6ca8eb6.
-- Full suite: 58 passed.
+- Reviewed implementation commit: 86575f3; report commit: a52bf91.
+- Full suite: 62 passed.
 - python -m compileall -q codemem: pass.
 - node --check web/app.js: pass.
-- P0 đã xác minh và đã xóa/thu gọn: files path-PK migration giữ vector_ok/vector_gen và upsert được, legacy marker mark gen0 pending trên DB copy, gen0 immediate delete bỏ generation gate, summary API nhận tham số generation và các fix vòng trước.
+- P0 đã xác minh và đã xóa/thu gọn: files_needing_summary trả vector_gen, canonical migration carry vector_gen vào file tombstone, gen0 retry bỏ ungated delete khi file hiện tại đã có gen>0 (nhưng còn crash-window vector_ok=0 bên dưới) và các fix vòng trước.
 - Không được làm regression các phần trên.
 
 ## ACTIVE TASKS
@@ -44,8 +44,8 @@ files.vector_ok, startup/manual/switch reconcile và embed-model marker đã có
 - Reconcile chỉ thấy vector_ok=0; collection mất/corrupt bên ngoài trong khi DB còn 1 không được phát hiện.
 - mark_all_vectors_stale áp dụng mọi project nhưng startup chỉ reconcile active; project khác chỉ repair khi được switch tới.
 - EMBED_MODEL đổi nhưng vẫn dùng collection cố định `code`; nếu model mới khác dimension/config, mark stale rồi add vào collection cũ có thể fail vĩnh viễn. Meta lại được cập nhật trước khi rebuild thành công.
-- Summary embeddings chưa có trạng thái pending/version/reconcile. `index_summary` đã nhận generation nhưng **files_needing_summary không SELECT vector_gen**; Codex repro file gen=1 nhưng summary row chỉ có path/lang/skeleton, nên summarizer vẫn ghi generation=0.
-- Re-index file xóa summary nhưng reconcile không add lại; retrieval còn bỏ qua kind `summary`, nên index này vừa không được dùng vừa có thể stale/orphan. Thêm vector_gen vào query, generation-aware summary state và test delete→recreate/summarize concurrency.
+- Summary query/generation cơ bản đã sửa, nhưng summary embeddings chưa có trạng thái pending/version/reconcile.
+- Re-index file xóa summary nhưng reconcile không add lại; retrieval còn bỏ qua kind `summary`, nên index này vừa không được dùng vừa có thể stale/orphan. Cần generation-aware summary state và test delete→recreate/summarize concurrency.
 - Chưa có inventory/content hash để đối chiếu vector thực tế; UI chưa surface pending/repair.
 - Dùng collection generation/version theo embedding model (kèm dimension/config), chỉ promote marker sau rebuild thành công; lưu content hash/inventory cho từng loại document và repair idempotent cho mọi project/summary.
 - Thêm integration test collection mất/đổi model nhưng DB vẫn vector_ok=1.
@@ -67,18 +67,18 @@ roots_canon_v2, normcase dedup, overview invalidation và cleanup intent cùng t
 - Có backup/rollback hoặc recovery contract rõ cho schema/data migration.
 - Marker vẫn là boolean rời rạc thay vì migration version/ledger có transaction và diagnostics.
 - files path-PK normal migration đã sửa, nhưng DDL `CREATE files_new` chưa có explicit BEGIN/recovery. Crash sau create trước copy để lại files_new; lần init sau CREATE lại có thể fail. Thêm recovery/ledger và test interrupted ở từng phase.
-- Canonical migration vẫn gọi add_tombstones_bulk không truyền vector_gen, nên file cleanup intent mặc định generation=0 kể cả vector cũ đã có gen>0. Carry generation từ row vào intent hoặc dùng project cleanup/supersession an toàn.
 - Test upgrade thực tế từ DB chỉ có roots_canon_v1=1, transaction rollback/process interruption, overview merge, legacy vector metadata và junction thật/adapter deterministic.
 
 ### P0-10 — Mutation SQLite/vector chưa có partial-result contract
 
 Atomic clear, SQL scope filter, forced collection fence và generation guard cho vector mới đã đạt. Các lỗi còn lại:
 
-- Gen0 delete không gate giải quyết immediate legacy delete, nhưng tạo race mới: legacy tombstone fail/backoff → file được tạo lại gen>0 → retry gen0 xóa **tất cả**, gồm vector mới. Trước ungated retry phải kiểm tra DB current generation/vector_ok hoặc force+ack legacy cleanup trước mọi reindex cùng path.
-- Thêm test exact: delete legacy gen0 fail → recreate/index gen1 → retry intent; gen1 phải còn và tombstone được supersede/ack an toàn.
+- Guard gen0 đã tránh xóa vector mới khi current gen>0, nhưng chỉ check generation là chưa đủ. **Codex repro crash-window:** legacy delete tạo tombstone gen0 → recreate chỉ chạy SQLite upsert gen1 rồi crash trước vector write (`vector_ok=0`) → worker ACK tombstone, `vector_delete_calls=[]`, pending tombstone=0; legacy vector vẫn có thể tồn tại.
+- Chỉ ACK stale gen0 khi current row chứng minh vector generation mới đã hoàn tất (`vector_ok=1`, tốt hơn là inventory xác nhận metadata gen hiện tại). Nếu current gen>0 nhưng vector_ok=0, phải ungated-clean legacy an toàn, ACK sau success và để reconcile dựng vector mới.
+- Thêm test exact cho recreate crash trước index_file và delete lần hai trước reconcile; không được mất cleanup intent hoặc để vector legacy orphan.
 - DB thật Codex đọc sau commit vẫn là 29 files, **7 gen0/vector_ok=1**, marker `legacy_gen_norm` chưa tồn tại vì app thật chưa init/restart. Sau init phải mark 7 pending; cần smoke sau restart chứng minh chúng thực sự re-embed rồi gen0/missing metadata về 0 trên mọi project.
 - Chroma trước vòng này có 9 vectors thiếu generation; SQLite marker không tự normalize Chroma, startup chỉ reconcile active project. Cần inventory/migration job cho tất cả project và trạng thái tiến độ.
-- Summary generation hiện vẫn là 0 do query thiếu vector_gen; stale legacy tombstone có thể xóa summary mới và DB summary không có pending vector state.
+- Summary generation query đã sửa, nhưng DB summary vẫn không có pending/version state và summarizer race với re-index/delete chưa được bảo vệ.
 - Viết integration test bằng Chroma thật cho missing-field + `$lte`, delete→recreate, summary delete và canonical cleanup; fake collection chỉ xác nhận shape where, không xác nhận match/delete semantics. Codex smoke `$lte` trên collection local không hoàn tất trong >30s, cần kiểm tra timeout/performance/lock thay vì để cleanup treo INDEX_LOCK.
 - `cleanup_worker` startup vẫn chỉ chạy **một lần rồi thoát**. Intent đang backoff lúc startup không tự chạy khi đến hạn; cần recurring scheduler có shutdown/cancel/backoff hoặc job system P1-16.
 - Backoff chưa jitter/updated_at; UI chưa có pending/retry action.
@@ -179,7 +179,7 @@ Atomic clear, SQL scope filter, forced collection fence và generation guard cho
 Python và multi-project wording đã sửa. Còn:
 
 - Roadmap vẫn đánh dấu Phase 1–3 hoàn tất dù active tasks còn nhiều.
-- Tests section chưa phản ánh 58 tests và coverage multi-project/migration/vector mới.
+- Tests section chưa phản ánh 62 tests và coverage multi-project/migration/vector mới.
 - Bổ sung schema migration, degraded semantics, health, project lifecycle và giới hạn hiện tại.
 
 ### P2-23 — UI project/explorer
@@ -241,89 +241,72 @@ Lệnh kiểm tra tối thiểu:
 ## CLAUDE_REPORT — temporary handoff
 
 <!-- CLAUDE_REPORT_START -->
-## Vòng: summary generation query + canonical tombstone generation + legacy retry race
+## Vòng: fix legacy gen0 ack crash-window (P0-10)
 
 ### Commit / working tree
-- Work commit: `86575f3` (codemem/storage/db.py, codemem/indexer/runner.py, 3 test file).
+- Work commit: `01a20ae` (codemem/storage/db.py, codemem/indexer/runner.py, tests/test_reconcile.py).
 - Report commit: chính commit chứa thay đổi workspace.md này.
 - Working tree sau report commit: clean (chỉ còn data/ gitignored). Không push.
 
 ### Task ID đã xử lý
-- **P0-5** — `index_summary` đã nhận generation nhưng `files_needing_summary` KHÔNG SELECT
-  `vector_gen` (Codex repro: file gen=1 nhưng summary row chỉ có path/lang/skeleton → summarizer
-  ghi generation=0).
-- **P0-8** — canonical migration gọi `add_tombstones_bulk` không truyền vector_gen → file
-  cleanup intent mặc định generation=0 kể cả vector cũ đã có gen>0.
-- **P0-10** — gen0 ungated retry tạo race mới: legacy tombstone fail/backoff → file được tạo
-  lại gen>0 → retry gen0 xóa **tất cả** gồm vector mới.
+- **P0-10** — crash-window Codex repro: guard gen0 vòng trước ack intent khi current gen>0,
+  nhưng nếu recreate chỉ chạy SQLite upsert (gen1) rồi crash TRƯỚC vector write (`vector_ok=0`),
+  worker ack tombstone mà không xóa → vector legacy orphan tồn tại vĩnh viễn + mất cleanup intent.
 
 ### File / schema / API đã đổi
 - `codemem/storage/db.py`:
-  - `files_needing_summary`: thêm `vector_gen` vào SELECT → summarizer ghi generation thật.
-  - `add_tombstones_bulk(conn, items)`: nhận item 3-phần tử `(scope,pid,path)` HOẶC 4-phần tử
-    `(scope,pid,path,generation)`; ghi cột `generation`; đổi `INSERT OR IGNORE` → `INSERT ...
-    ON CONFLICT(scope,project_id,file_path) DO UPDATE SET generation=MAX(generation,excluded.generation)`
-    (dedup + giữ generation cao nhất).
-  - `_migrate_canonical_roots`: SELECT thêm `vector_gen`; `vec_cleanup` mang `(pidx,path,vgen)`;
-    items file-scope truyền vgen của vector cũ vào intent. Project-scope intent dùng gen=0.
-  - **Hàm mới** `file_current_gen(path, project_id) -> int|None`: vector_gen hiện tại của file,
-    None nếu file không còn trong DB.
-  - Không đổi SCHEMA_VERSION (vẫn "3"); không thêm cột.
+  - Đổi `file_current_gen(path, project_id) -> int|None` thành
+    `file_vector_state(path, project_id) -> (vector_gen, vector_ok) | None`.
 - `codemem/indexer/runner.py`:
-  - `_retry_tombstones`: với file-scope, nếu `generation` falsy (legacy 0) → check
-    `db.file_current_gen`; nếu file tồn tại lại với gen>0 (đã re-index, `index_file` đã ungated
-    delete vector cũ trước khi add) → `del_tombstone` (ack stale intent), KHÔNG ungated delete →
-    tránh xóa nhầm vector mới. File absent (None) hoặc gen 0 → vẫn ungated delete (dọn orphan).
-    Intent gated (gen>=1) không đổi (an toàn nhờ `$lte`).
-- Không đổi API route nào.
+  - `_retry_tombstones`: với file-scope intent legacy (`generation` falsy), CHỈ ack-without-delete
+    khi `st = file_vector_state(...)` thỏa `st[0]>0 AND st[1]==1` (vector mới đã HOÀN TẤT →
+    `index_file` đã ungated-delete vector cũ). Các trường hợp còn lại — file absent (None),
+    gen 0, hoặc **gen>0 nhưng vector_ok=0 (crash-window)** — rơi xuống ungated `vectors.delete_file`
+    (generation=0) rồi ack-on-success; reconcile dựng lại vector mới sau.
+  - Gated intent (gen≥1) không đổi (an toàn nhờ `$lte`).
+- Không đổi schema/SCHEMA_VERSION; không đổi API route.
 
 ### Lệnh test + kết quả
-- `PYTHONPATH=. PYTHONUTF8=1 python -m pytest tests -q` → **62 passed** (58 baseline + 4 mới).
+- `PYTHONPATH=. PYTHONUTF8=1 python -m pytest tests -q` → **64 passed** (62 baseline + 2 mới;
+  1 test đổi tên/ngữ nghĩa).
 - `python -m compileall -q codemem` → pass.
 - `node --check web/app.js` → pass.
-- Test mới:
-  - `tests/test_tombstones.py::test_files_needing_summary_includes_vector_gen` — upsert file
-    gen g → `files_needing_summary` trả row có `vector_gen == g` (g≥1).
-  - `tests/test_projects.py::test_canonical_migration_carries_generation_into_tombstone` — 2
-    project cùng canonical root, file gen 11 (loser) + gen 22 (survivor) → sau migrate, file
-    tombstone mang đúng generation 11 và 22 (không phải 0).
-  - `tests/test_reconcile.py::test_retry_legacy_gen0_stale_when_file_recreated` — intent gen0 +
-    `file_current_gen`→7 → ack stale (del_tombstone), KHÔNG gọi `vectors.delete_file`.
-  - `tests/test_reconcile.py::test_retry_legacy_gen0_deletes_when_file_absent` — intent gen0 +
-    `file_current_gen`→None → vẫn ungated delete (generation=0) để dọn orphan.
+- Test (tests/test_reconcile.py):
+  - `test_retry_legacy_gen0_stale_when_recreate_complete` — `file_vector_state`→(7,1) → ack,
+    KHÔNG gọi `vectors.delete_file`.
+  - `test_retry_legacy_gen0_cleans_when_recreate_incomplete` (**crash-window**) —
+    `file_vector_state`→(1,0) → ungated `delete_file(generation=0)` + ack sau success (KHÔNG mất
+    intent, KHÔNG để orphan).
+  - `test_retry_legacy_gen0_deletes_when_file_absent` — `file_vector_state`→None → ungated delete.
+  - `test_file_vector_state_reflects_db` — DB thật: chưa có→None; sau upsert→(g,0); sau
+    set_vector_ok(True)→(g,1).
 
-### Smoke / integration evidence (BẢN COPY data/code_index.db thật, non-destructive)
-- `init_db()` trên copy: 28 files giữ nguyên, schema_version=3, pending(vector_ok=0)=7,
-  tombstones pending=0 (không phát sinh intent oan).
-- `files_needing_summary` trên copy: 28 row, keys = `['lang','path','skeleton','vector_gen']`
-  → field vector_gen đã có (P0-5 fix có hiệu lực trên DB thật).
-- Bản copy đã xóa; DB thật không bị chạm.
+### Smoke / integration evidence
+- Không chạy smoke DB thật vòng này (chỉ đổi logic guard + helper SQL, không đổi schema/migration;
+  64/64 test xanh gồm 1 test DB thật cho `file_vector_state`). Real-DB migration đã smoke ở 2 vòng
+  trước và không đổi.
 
 ### Partial / còn thiếu (KHÔNG hoàn thành vòng này — vẫn mở trong ACTIVE TASKS)
-- **P0-10 — integration test bằng Chroma THẬT** cho missing-field + `$lte`, delete→recreate,
-  summary delete, canonical cleanup VẪN CHƯA có. Toàn bộ test vòng này dùng fake/monkeypatch:
-  xác nhận shape where + control-flow guard, KHÔNG xác nhận match/delete semantics thật của
-  Chroma. Codex smoke `$lte` >30s (performance/lock) chưa điều tra.
-- **P0-10 — recurring cleanup scheduler**: `cleanup_worker` startup vẫn one-shot; intent đang
-  backoff lúc startup không tự chạy khi đến hạn (gắn P1-16). Chưa làm.
-- **P0-10 — normalize 9 vector thật thiếu generation trong Chroma + restart smoke chứng minh
-  re-embed về gen>0 trên mọi project**: vẫn chưa; SQLite marker không tự normalize Chroma, và
-  startup chỉ reconcile active project (mark_all_vectors_stale áp mọi project nhưng repair chỉ
-  khi switch tới — P0-5/P0-6 còn mở).
-- **P0-5 — retrieval vẫn bỏ qua kind `summary`**; summary chưa có pending/version/reconcile
-  state; collection generation theo embedding-model/dimension chưa làm. Re-index xóa summary
-  nhưng reconcile không add lại — chưa xử lý.
-- **P0-8 — files_new DDL chưa có explicit recovery/ledger** (crash sau CREATE trước RENAME để
-  lại files_new; init sau CREATE lại fail). Migration version/ledger + backup/rollback chưa làm.
-- **P0-6** — generation/project-existence re-check sau khi lấy INDEX_LOCK; summarizer trong
-  lock — chưa đụng vòng này.
+- **P0-10 — integration test bằng Chroma THẬT** (missing-field + `$lte`, delete→recreate, summary
+  delete, canonical cleanup) VẪN dùng fake/monkeypatch. Crash-window cũng test bằng monkeypatch
+  `file_vector_state`/`delete_file`, chưa chứng minh semantics xóa thật trên Chroma. Codex smoke
+  `$lte` >30s chưa điều tra (performance/lock).
+- **P0-10 — recurring cleanup scheduler** (`cleanup_worker` one-shot; backoff không tự đến hạn) —
+  chưa làm (gắn P1-16).
+- **P0-10 — normalize 9 vector thật thiếu generation trong Chroma + smoke sau restart** chứng minh
+  re-embed về gen>0 trên MỌI project — chưa; startup chỉ reconcile active project.
+- **P0-10 — backoff jitter/updated_at; UI pending/retry** — chưa.
+- **P0-5 — summary pending/version/reconcile state; retrieval kind `summary`; re-index xóa summary
+  nhưng reconcile không add lại; collection generation theo embed-model/dimension** — chưa.
+- **P0-8 — files_new DDL recovery/ledger + migration version/ledger + backup/rollback** — chưa.
+- **P0-6 — re-check generation/project-existence sau INDEX_LOCK; summarizer trong lock** — chưa.
 
 ### Regression / phát hiện mới
-- Không phát hiện regression mới. 62/62 xanh; các P0 baseline (atomic clear, scope filter,
-  collection fence, generation guard vector mới, tombstone-v1 recovery, files path-PK migration)
-  vẫn pass.
-- Lưu ý reviewer: guard legacy-retry dựa giả định "file tồn tại với gen>0 ⇒ index_file đã ungated
-  delete vector cũ". Điều này đúng với mọi đường ghi hiện tại (`_index_one` và `reconcile_vectors`
-  đều gọi `vectors.index_file`, mà `index_file` mở đầu bằng `delete_file(path, project_id)` ungated).
-  Nếu sau này có đường tạo file row mà KHÔNG đi qua index_file, giả định này cần xét lại.
+- Không phát hiện regression mới. 64/64 xanh; các P0 baseline vẫn pass.
+- Lưu ý reviewer: guard vẫn dựa giả định "vector_ok=1 ⇒ index_file đã ungated-delete vector cũ
+  trước khi add". Đúng với mọi đường ghi hiện tại (`_index_one`, `reconcile_vectors` đều qua
+  `vectors.index_file`, mà `index_file` mở đầu bằng `delete_file(path, project_id)` ungated).
+  `set_vector_ok(True)` chỉ được gọi sau khi `index_file` trả True (xem `_index_one`/`reconcile_vectors`),
+  nên vector_ok=1 thực sự hàm ý add đã chạy. Nếu sau này có đường set vector_ok=1 mà không qua
+  index_file thì giả định cần xét lại.
 <!-- CLAUDE_REPORT_END -->
