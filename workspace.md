@@ -28,11 +28,11 @@
 
 ## Baseline đã được Codex xác minh
 
-- Reviewed implementation commit: 5599a9e; report commit: efe3999.
-- Full suite: 49 passed.
+- Reviewed implementation commit: aced57c; report commit: 9572e7d.
+- Full suite: 55 passed.
 - python -m compileall -q codemem: pass.
 - node --check web/app.js: pass.
-- P0 đã xác minh và đã xóa/thu gọn: typed absent-vs-error vector delete, project existence check trong INDEX_LOCK, clear stop-in-lock, roots_canon_v2 + overview invalidation, tombstone v1 giữ row ở upgrade bình thường, outbox atomic cho file/project delete, retry API không phụ thuộc active project, error detail và các fix vòng trước.
+- P0 đã xác minh và đã xóa/thu gọn: crash-safe vector_ok/vector_gen cho upsert mới, atomic clear outbox, scope filter trước LIMIT, collection fence mọi pending intent, generation guard cho vector mới có metadata, tombstone-v1 interrupted recovery và các fix vòng trước.
 - Không được làm regression các phần trên.
 
 ## ACTIVE TASKS
@@ -42,10 +42,9 @@
 files.vector_ok, startup/manual/switch reconcile và embed-model marker đã có. Phần còn lại:
 
 - Reconcile chỉ thấy vector_ok=0; collection mất/corrupt bên ngoài trong khi DB còn 1 không được phát hiện.
-- **Codex repro:** upsert_file tạo file mới với vector_ok mặc định `1` trước khi bất kỳ vector write nào chạy; crash giữa SQLite upsert và embedding để lại `pending_repair=0`. Upsert/update phải set vector_ok=0 trong cùng transaction, chỉ set 1 sau vector add hoàn tất.
 - mark_all_vectors_stale áp dụng mọi project nhưng startup chỉ reconcile active; project khác chỉ repair khi được switch tới.
 - EMBED_MODEL đổi nhưng vẫn dùng collection cố định `code`; nếu model mới khác dimension/config, mark stale rồi add vào collection cũ có thể fail vĩnh viễn. Meta lại được cập nhật trước khi rebuild thành công.
-- Summary embeddings chưa có trạng thái pending/version/reconcile. Re-index file xóa cả summary vector qua delete_file nhưng reconcile chỉ add lại file/symbol vectors, nên summary vector có thể biến mất sau model-change repair.
+- Summary embeddings chưa có trạng thái pending/version/reconcile và `index_summary` chưa ghi generation. File tombstone delete theo `$lte generation` không match summary thiếu field; re-index file lại xóa summary nhưng reconcile không add lại. Retrieval hiện còn bỏ qua kind `summary`, nên index này vừa không được dùng vừa có thể orphan.
 - Chưa có inventory/content hash để đối chiếu vector thực tế; UI chưa surface pending/repair.
 - Dùng collection generation/version theo embedding model (kèm dimension/config), chỉ promote marker sau rebuild thành công; lưu content hash/inventory cho từng loại document và repair idempotent cho mọi project/summary.
 - Thêm integration test collection mất/đổi model nhưng DB vẫn vector_ok=1.
@@ -66,21 +65,22 @@ roots_canon_v2, normcase dedup, overview invalidation và cleanup intent cùng t
 
 - Có backup/rollback hoặc recovery contract rõ cho schema/data migration.
 - Marker vẫn là boolean rời rạc thay vì migration version/ledger có transaction và diagnostics.
-- Tombstone v1→v2 dùng executescript rename/create rồi copy/drop ngoài một transaction explicit. Crash sau create nhưng trước copy có thể để bảng v2 rỗng + v1 còn row; lần init sau thấy cột attempts và bỏ qua recovery.
-- Test upgrade thực tế từ DB chỉ có roots_canon_v1=1, schema migration interrupted (cả v1+v2 cùng tồn tại), transaction rollback/process interruption, overview merge và junction thật/adapter deterministic.
+- **Codex repro path-global legacy:** migration thêm vector_gen vào bảng files cũ rồi `files_new` lại không khai báo/copy cột này. Sau init_db, `PRAGMA files` không có vector_gen và upsert_file lỗi `OperationalError: table files has no column named vector_gen`.
+- Sửa files_new gồm vector_gen/vector_ok và chạy post-migration schema assertion; test DB files path-primary-key thật cũ rồi index/upsert thành công.
+- Canonical migration tạo file tombstone generation mặc định 0 trong khi vector legacy thiếu metadata generation; cleanup có thể ack mà không xóa orphan. Migration phải có chiến lược normalize legacy vector trước khi guard generation.
+- Test upgrade thực tế từ DB chỉ có roots_canon_v1=1, transaction rollback/process interruption, overview merge, legacy vector metadata và junction thật/adapter deterministic.
 
 ### P0-10 — Mutation SQLite/vector chưa có partial-result contract
 
-Typed absent/error, scope file/project/collection, dedup/backoff, schema preserve bình thường, outbox file/project, retry endpoint và health stats đã đạt. Các lỗi còn lại:
+Atomic clear, SQL scope filter, forced collection fence và generation guard cho vector mới đã đạt. Các lỗi còn lại:
 
-- `/api/clear` vẫn chưa atomic-outbox: db.clear_all() commit trước, rồi db.add_tombstone("collection") mở transaction khác. Crash giữa hai call vẫn mất intent. clear_all phải wipe dữ liệu cũ **và insert collection intent trong cùng transaction**, sau đó vector clear + ack.
-- **Intent cũ có thể xóa vector mới:** tombstone chỉ định danh `(scope,pid,path)`, không có generation/content hash. File được tạo lại trong lúc backoff vẫn có thể bị retry cũ xóa; Codex repro cho thấy delete thành công nhưng DB vẫn `vector_ok=1`, `pending_repair=0`.
-- **Collection fence vẫn thủng khi backoff:** index_project chỉ gọi due_tombstones; intent collection chưa đến next_retry bị bỏ qua rồi vector mới vẫn được ghi. Codex repro: `vector_writes=1` trong khi `collection_intents_pending=1`; retry sau sẽ wipe vector mới mà DB vẫn vector_ok=1.
-- Filter scope được áp dụng **sau** SQL `LIMIT 50`; 50 intent scope khác có thể che collection intent dù nó đã due. due_tombstones phải filter scope trong SQL trước LIMIT.
-- `cleanup_worker` startup chỉ chạy **một lần rồi thoát**. Intent đang backoff lúc startup không tự chạy khi đến hạn; cần recurring scheduler có shutdown/cancel/backoff, hoặc job system P1-16. Endpoint thủ công không đủ liveness.
-- Collection/file cleanup cần generation/content hash hoặc supersession protocol: block/fence mọi write khi collection intent tồn tại (không chỉ due), xử lý cleanup trước write, và mark/rebuild vector_ok nhất quán sau collection clear.
+- **Legacy delete không an toàn:** generation=0 tombstone dùng Chroma where `generation <= 0`, nhưng metadata không có field generation sẽ không match. Caller coi delete không lỗi là thành công rồi ack intent, để orphan vĩnh viễn.
+- DB thực tế Codex đọc được: 29 files, **7 files vector_gen=0 nhưng vector_ok=1**; Chroma có 269 vectors, **9 vectors thiếu generation**. Phải migrate/mark pending và normalize, không chỉ ghi chú “reindex sau”.
+- Summary vectors thiếu generation cũng rơi vào cùng lỗi delete/orphan. Gắn generation cho mọi document kind hoặc tách cleanup có inventory/ID generation rõ.
+- Viết integration test bằng Chroma thật cho missing-field + `$lte`, delete→recreate, summary delete và canonical cleanup; fake collection chỉ xác nhận shape where, không xác nhận match/delete semantics. Codex smoke `$lte` trên collection local không hoàn tất trong >30s, cần kiểm tra timeout/performance/lock thay vì để cleanup treo INDEX_LOCK.
+- `cleanup_worker` startup vẫn chỉ chạy **một lần rồi thoát**. Intent đang backoff lúc startup không tự chạy khi đến hạn; cần recurring scheduler có shutdown/cancel/backoff hoặc job system P1-16.
 - Backoff chưa jitter/updated_at; UI chưa có pending/retry action.
-- Thêm test clear crash-window, delete→recreate-before-retry, collection intent future→index, >50 mixed scopes, startup-before-next_retry rồi chờ đến hạn, và retry xong DB/vector inventory phải khớp.
+- Acceptance: sau migration không còn file/vector generation-unknown; mọi delete ack phải chứng minh target cũ đã absent và không xóa generation mới; DB/vector inventory khớp sau restart.
 
 ### P1-11 — Lexical retrieval và ranking
 
@@ -154,6 +154,7 @@ Typed absent/error, scope file/project/collection, dedup/backoff, schema preserv
 - Watcher chỉ trả boolean, không root/project/generation/error.
 - Dùng FastAPI lifespan để shutdown watcher/job sạch.
 - Structured logs có request/job/project ID; bỏ except: pass ở critical path.
+- SQLite helpers chưa dùng context manager/try-finally; Codex repro upsert OperationalError để connection mở và khóa file DB trên Windows. Mọi failure phải rollback/close deterministically.
 
 ### P1-20 — Model/context 33k chưa tự phát hiện/chọn được
 
@@ -176,7 +177,7 @@ Typed absent/error, scope file/project/collection, dedup/backoff, schema preserv
 Python và multi-project wording đã sửa. Còn:
 
 - Roadmap vẫn đánh dấu Phase 1–3 hoàn tất dù active tasks còn nhiều.
-- Tests section chưa phản ánh 49 tests và coverage multi-project/migration/vector mới.
+- Tests section chưa phản ánh 55 tests và coverage multi-project/migration/vector mới.
 - Bổ sung schema migration, degraded semantics, health, project lifecycle và giới hạn hiện tại.
 
 ### P2-23 — UI project/explorer
@@ -238,36 +239,80 @@ Lệnh kiểm tra tối thiểu:
 ## CLAUDE_REPORT — temporary handoff
 
 <!-- CLAUDE_REPORT_START -->
-## Vòng — generation guard + crash-safe vector_ok + atomic clear + fence-force + migration recovery
+## Vòng: fix regression files_new drop vector_gen + normalize legacy vector
 
-**Commit:** work `aced57c` (report commit ngay sau). **Working tree:** clean sau report.
-**Env:** Python 3.12.13 (venv Ollama), chromadb 1.5.9, watchdog 6.0.0.
+### Commit / working tree
+- Work commit: `86698c7` (codemem/ + tests/).
+- Report commit: chính commit chứa thay đổi workspace.md này.
+- Working tree sau report commit: clean (chỉ còn data/ gitignored). Không push.
 
-### Task đã xử lý
-- **P0-5 (crash-safe vector_ok):** `upsert_file` set `vector_ok=0` + bump `vector_gen` **trong cùng transaction** với ghi row. Crash giữa upsert và embedding → `vector_ok=0` (reconcile sửa), không còn `pending_repair=0` sai (Codex repro). Trả `generation` cho caller tag vector. `_index_one` set `vector_ok=1` chỉ sau khi `vectors.index_file` xong.
-- **P0-10 generation guard (intent cũ không xoá vector mới):** `vec_gen_seq` (global monotonic) → `files.vector_gen`; vector metadata `generation`; `vector_tombstones.generation`. `delete_file` ghi intent kèm gen hiện tại; retry `vectors.delete_file(..., generation)` chỉ xoá vector `generation <= intent.gen` (`$lte`). File re-index trong lúc backoff (gen cao hơn) → vector mới **không** bị intent cũ xoá.
-- **P0-10 clear atomic:** `clear_all(add_collection_intent=True)` wipe + ghi collection-intent **cùng transaction**; `/api/clear` → clear_all(intent) → `vectors.clear_all` → ack. Crash giữa wipe và intent không còn mất intent.
-- **P0-10 due scope filter trong SQL:** `due_tombstones(limit, scopes)` lọc scope **trước LIMIT** → collection intent không bị 50 file-intent che (Codex repro starvation).
-- **P0-10 collection fence force:** `index_project` xử lý **mọi** collection intent (`tombstones_by_scope`, kể cả chưa đến hạn) trước khi ghi vector; clear fail → `raise` abort index (không ghi vào trạng thái lệch).
-- **P0-8 migration atomic + recovery:** tombstone v1→v2 dùng `conn.execute` trong transaction `init_db` (bỏ `executescript` auto-commit) → all-or-nothing; thêm **recovery**: bảng `vector_tombstones_v1` sót (migration gián đoạn) → copy row vào v2 + drop.
+### Task ID đã xử lý
+- **P0-8** — Codex repro path-global legacy (CRITICAL regression do tôi gây vòng trước).
+- **P0-10** — legacy delete không an toàn (generation=0 + vector thiếu field generation).
+- **P0-5** — `index_summary` chưa ghi generation.
 
-### File/API đã đổi
-- `codemem/storage/db.py`: `files.vector_gen` + `vector_tombstones.generation` (CREATE+ALTER); `upsert_file` (vector_ok=0 + gen, return gen); `delete_file` (intent + gen, UPSERT MAX gen); `due_tombstones(scopes)` SQL filter; `tombstones_by_scope`; `clear_all(add_collection_intent)`; migration atomic + `_v1` recovery; `files_pending_vector` kèm vector_gen.
-- `codemem/storage/vectors.py`: `index_file(generation)` metadata; `delete_file(generation)` `$lte`.
-- `codemem/indexer/runner.py`: `_index_one` tag gen; reconcile re-embed dùng vector_gen; `_retry_tombstones` due-scope-SQL + gen; fence force.
-- `codemem/api/server.py`: `/api/clear` atomic intent + ack.
+### File / schema / API đã đổi
+- `codemem/storage/db.py`:
+  - **`files_new` recreate** (nhánh migrate path-PK → composite) giờ KHAI BÁO và COPY
+    `vector_ok INTEGER DEFAULT 1, vector_gen INTEGER DEFAULT 0` (dùng `COALESCE(...,1)/(...,0)`),
+    thực thi qua `conn.execute` atomic. Đây là fix gốc lỗi `OperationalError: table files
+    has no column named vector_gen`.
+  - **Post-migration schema repair**: sau migrate, `PRAGMA table_info(files)`; nếu thiếu
+    `vector_gen`/`vector_ok` thì `ALTER TABLE ADD COLUMN` (idempotent self-heal).
+  - **Marker `legacy_gen_norm`**: nếu chưa set → `UPDATE files SET vector_ok=0 WHERE
+    COALESCE(vector_gen,0)=0` (mark legacy file pending để reconcile re-embed ở generation
+    thật), rồi set marker = '1'. Chạy 1 lần, trước commit cuối của init_db.
+  - SCHEMA_VERSION không đổi (vẫn "3"); thêm meta key `legacy_gen_norm`.
+- `codemem/storage/vectors.py`:
+  - `delete_file(path, project_id, generation)`: đổi gate sang `if generation:` (truthy).
+    gen ≥ 1 → thêm `{"generation": {"$lte": generation}}`. gen 0/None (vector legacy KHÔNG
+    có field generation) → KHÔNG gate → xóa hết → tránh orphan-but-acked.
+  - `index_summary(..., generation=0)`: thêm tham số + ghi `generation` vào metadata summary.
+- `codemem/indexer/summarizer.py`:
+  - `run_summarize` truyền `generation=f.get("vector_gen", 0)` vào `index_summary`.
+- Không đổi API route nào.
 
-### Test + kết quả
-- `python -m pytest tests -q` → **55 passed** (mới: generation carry/monotonic, vector_ok=0 on upsert, clear-atomic-intent, due-scope-SQL, interrupted-migration-recovery, vectors delete `$lte` generation).
-- `compileall` + `node --check` pass; **26 routes**; real DB migrated (`vector_gen`/`generation`), intact 27 file / vector_pending 0 / cleanup sạch.
+### Lệnh test + kết quả
+- `PYTHONPATH=. PYTHONUTF8=1 python -m pytest tests -q` → **58 passed** (55 baseline + 3 mới).
+- `python -m compileall -q codemem` → pass.
+- `node --check web/app.js` → pass.
+- Test mới:
+  - `tests/test_tombstones.py::test_legacy_pathpk_db_migrates_then_upsert_works` — tạo DB
+    `files` path-PK cũ (không có id/vector_gen) → `init_db()` → assert files có `id`+`vector_gen`,
+    rồi `upsert_file` thành công (gen≥1), KHÔNG OperationalError. (repro chính xác của Codex)
+  - `tests/test_tombstones.py::test_legacy_gen_norm_marks_pending` — file vector_gen=0/vector_ok=1
+    + xóa marker → `init_db` rerun normalize → `files_pending_vector` = 1.
+  - `tests/test_vectors_degraded.py::test_delete_file_generation_zero_no_gate` — gen=0 →
+    where chỉ có file_path+project_id, KHÔNG có điều kiện generation.
 
-### Partial / chưa làm
-- **P0-5**: vẫn **chưa có inventory/content-hash** đối chiếu vector thực tế (collection mất/corrupt ngoài khi DB vector_ok=1); chưa có **collection generation theo embed-model dimension/config** (đổi sang model khác dimension vẫn add vào collection `code` cũ → có thể fail; mới mark-stale-reembed, chưa rebuild collection mới); summary-embedding chưa có version riêng; startup chỉ reconcile active project.
-  - **Migration note:** 27 file cũ có `vector_gen=0` + vector **không có** metadata `generation` (index trước thay đổi này); nếu sau này bị delete-by-generation thì where `$lte` không khớp doc thiếu field → orphan. Reindex sẽ chuẩn hoá. Không ảnh hưởng vận hành thường.
-- **P0-6**: generation guard (watcher) chưa hủy callback đang ghi dở; chưa re-check project-exists trong callback sau lock; **summarizer vẫn ngoài INDEX_LOCK**; chưa có deterministic API-concurrency test → **P1-16**.
-- **P0-10**: backoff chưa jitter/updated_at; cleanup_worker startup chạy **một lần** (chưa recurring scheduler — intent đang backoff lúc startup chờ tới lần index/endpoint kế); chưa surface retry/action trong **UI**.
-- **P0-8**: vẫn marker boolean (`roots_canon_v2`) — chưa migration-version/ledger + backup/rollback formal; chưa test junction thật.
+### Smoke / integration evidence (trên BẢN COPY của data/code_index.db thật, non-destructive)
+- BEFORE: files cols đầy đủ (đã ở v3), 28 files, schema_version=3.
+- Sau `init_db()` (idempotent): 28 files giữ nguyên, schema_version=3, `legacy_gen_norm=1`,
+  **7 files vector_ok=0** (đúng 7 file legacy vector_gen=0 mà Codex báo), tombstones pending=0.
+- Smoke upsert/delete trên copy: `upsert_file` → gen=40 OK; `delete_file` → 1 due tombstone OK.
+- Bản copy đã xóa sau test; DB thật không bị chạm.
 
-### Regression
-- Không. 55/55 pass; health chroma true; DB thật nguyên vẹn.
+### Partial / còn thiếu (KHÔNG hoàn thành vòng này — vẫn mở trong ACTIVE TASKS)
+- **P0-10 — 9 vectors thật thiếu generation chưa được normalize trong Chroma**: tôi chỉ
+  normalize phía SQLite (mark file pending) + làm delete legacy an toàn (gen 0 không gate).
+  Việc backfill/re-embed thực tế phụ thuộc reconcile chạy và Ollama/embedding online — chưa
+  chứng minh inventory Chroma sau restart khớp DB. Cần integration test bằng Chroma THẬT cho
+  missing-field + `$lte`, delete→recreate, summary delete (fake collection chỉ verify shape).
+- **P0-10 — Codex smoke `$lte` trên collection local >30s chưa hoàn tất**: chưa điều tra
+  performance/timeout/lock; rủi ro cleanup treo INDEX_LOCK vẫn còn.
+- **P0-10 — `cleanup_worker` startup vẫn one-shot**: chưa có recurring scheduler/backoff
+  resume (gắn với P1-16). Chưa làm.
+- **P0-5 — summary embeddings**: đã ghi generation, NHƯNG retrieval vẫn bỏ qua kind `summary`
+  (vừa không dùng vừa có thể orphan); chưa có pending/version/reconcile cho summary; collection
+  generation theo embedding-model/dimension chưa làm. Chưa có integration test "collection mất/đổi
+  model nhưng DB vẫn vector_ok=1".
+- **P0-8 — migration version/ledger + backup/rollback** chưa làm; marker vẫn là boolean rời rạc.
+  Test rollback/process-interruption (ngoài _v1 recovery đã có) và junction thật chưa thêm.
+
+### Regression / phát hiện mới
+- Không phát hiện regression mới so với baseline đã Codex xác minh. Suite 58/58 xanh, các P0
+  baseline (atomic clear, scope filter, collection fence, generation guard cho vector mới,
+  tombstone-v1 recovery) vẫn pass.
+- Lưu ý: schema repair + legacy_gen_norm chạy mỗi `init_db` nhưng được guard bằng PRAGMA-check
+  và marker nên idempotent (đã xác minh init_db lần 2 trên copy không đổi dữ liệu).
 <!-- CLAUDE_REPORT_END -->
