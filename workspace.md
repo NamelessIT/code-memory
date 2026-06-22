@@ -28,18 +28,18 @@
 
 ## Baseline đã được Codex xác minh
 
-- Reviewed implementation commit: 4c511b6; report commit: 76f5a92.
-- Full suite: 77 passed.
+- Reviewed implementation commit: a2fff51; report commit: 96867ae.
+- Full suite: 85 passed.
 - python -m compileall -q codemem: pass.
 - node --check web/app.js: pass.
-- P0 đã xác minh và đã xóa/thu gọn: reconcile-all duyệt mọi project; legacy gen0 được cấp generation thật; startup repair `vec_gen_seq` thiếu/thấp/malformed; generation allocation + file/symbol/edge/route mutation cùng một `BEGIN IMMEDIATE`, rollback/close deterministic và `vector_ok` chỉ đổi khi generation khớp; scheduler cleanup chạy lặp, không tạo duplicate worker và health phân biệt running/busy/stuck; shutdown hook cơ bản và các fix vòng trước.
+- P0 đã xác minh và đã xóa/thu gọn: reconcile-all duyệt mọi project; legacy gen0 được cấp generation thật; startup repair `vec_gen_seq` thiếu/thấp/malformed; generation allocation + mutation cùng một `BEGIN IMMEDIATE`; watcher re-check generation/project sau `INDEX_LOCK`; runner/reconcile fail closed cho project đã xóa; summarizer drop file result khi project mất hoặc file generation đổi; scheduler cleanup không tạo duplicate và health phân biệt stuck; các fix vòng trước.
 - Không được làm regression các phần trên.
 
 ## TASK DISTRIBUTION — thứ tự triển khai
 
 Claude Code chỉ nhận **một batch tại một thời điểm**, ghi báo cáo và chờ Codex audit trước khi sang batch kế. Không gộp UI/P1 vào batch P0.
 
-1. **NOW — Batch B / P0-6: project lifecycle concurrency.** Đây là task duy nhất của vòng kế tiếp. Watcher/summarizer/reconcile phải fail closed khi project, watcher generation hoặc file generation đã stale; acceptance chi tiết nằm trong P0-6.
+1. **NOW — Batch B follow-up / P0-6: đóng hai race còn lại.** Đây là task duy nhất của vòng kế tiếp: stale watcher timer không được xóa pending generation mới; overview chỉ được publish nếu snapshot file/summary vẫn hiện hành. Acceptance và Codex repro nằm trong P0-6.
 2. **NEXT — Batch C / P0-8: migration recovery.** Versioned ledger, explicit transaction/recovery cho `files_new`, backup/rollback contract và interrupted-phase tests.
 3. **THEN — Batch D / P0-5 + P0-10: vector truth/inventory.** Collection version theo embedding model, generation-gated Chroma publish/write-order, DB↔Chroma inventory/reconcile mọi project và summary state.
 4. **LAST P0 — Batch E / P0-10: Chroma execution boundary.** Real-Chroma integration (`$lte`, missing generation, concurrent write order, delete→recreate), timeout/cancel/process isolation và live restart smoke. Chỉ làm sau khi Batch B–D ổn định.
@@ -62,15 +62,12 @@ files.vector_ok, startup/manual/switch reconcile và embed-model marker đã có
 
 ### P0-6 — Serialize index/watch/delete concurrency
 
-INDEX_LOCK đã bao stop → mutate → start cho index/select/delete. Phần còn lại:
+Batch B core đã đạt: callback lấy `INDEX_LOCK` rồi re-check generation/project; runner và reconcile tự fail closed; file summary chỉ commit khi project còn và `vector_gen` khớp. Phần còn lại:
 
-- Generation guard không dừng callback đã copy pending và đang chờ INDEX_LOCK. Sau project delete, callback cũ có thể chạy với pid đã xóa và tạo lại file/vector mồ côi vì schema không có FK/project-exists guard.
-- Summarizer vẫn ngoài lock; project bị xóa giữa job có thể để summary vector hoặc overview cho pid không còn tồn tại.
-- Thread reconcile được tạo sau project select cũng có thể chờ lock rồi chạy với pid vừa bị delete/switch; `reconcile_vectors()` chưa fail closed cho project không tồn tại.
-- Error mới chỉ print; chưa vào structured job log/retry.
-- Batch B implementation: watcher `_flush` phải lấy `INDEX_LOCK` rồi re-check watcher generation, bound project ID/root và project existence trước mọi write; `index_single_file`/`remove_file`/`reconcile_vectors` cũng tự fail closed sau khi đã lấy lock, không dựa riêng vào caller.
-- Summarizer có thể gọi Ollama ngoài lock, nhưng trước commit summary/vector/overview phải lấy `INDEX_LOCK`, re-check project còn tồn tại và file `vector_gen` vẫn bằng snapshot. File đã re-index/delete hoặc project đã delete thì drop kết quả cũ; không tạo vector/meta mồ côi.
-- Cần deterministic Event/Barrier tests: watcher đã copy pending rồi chờ lock → select/delete/stop → callback cũ không ghi; summarizer đang chờ LLM → file re-index/project delete → không ghi summary/vector/overview; reconcile thread stale pid → không gọi Chroma. Test phải kiểm tra cả SQLite, vector fake calls và tombstone side effects.
+- **Watcher pending-loss:** nhánh đầu `_flush(gen)` đang gọi `self._pending.clear()` khi `gen != self.generation`. Codex repro: manager generation 2 có pending `{/new-generation.py: False}`, stale timer gen 1 chạy → pending generation mới thành `{}`. Stale timer chỉ được return/drop dữ liệu của chính nó, tuyệt đối không clear shared pending của generation hiện tại; nếu cần, pending phải được partition/tag theo generation.
+- **Overview stale publish:** `build_overview()` snapshot summary trước LLM nhưng lúc commit chỉ kiểm tra `project_exists`. Codex repro: `_ask` re-index file (upsert xóa summary + invalidate overview) rồi trả overview từ `OLD SUMMARY`; hàm sau đó ghi lại chính overview cũ. Cần snapshot revision/fingerprint ổn định (ít nhất path + vector_gen + summary/hash) và compare trong `INDEX_LOCK` trước `set_overview`; project/file/summary đổi thì drop kết quả.
+- Thêm đúng hai regression test trên. Bổ sung Event/Barrier test thật cho timer đã copy pending rồi stop/start/new event, và overview LLM đang chờ trong lúc re-index/delete. Test project-delete phải assert cả `db.get_overview(pid)==''`, không chỉ vector/summary.
+- Error `print`/structured job retry không chặn Batch B follow-up; giữ ở P1-16/P1-19.
 
 ### P0-8 — Hoàn thiện canonical-root migration rollout
 
@@ -188,7 +185,7 @@ Atomic clear, SQL scope filter, forced collection fence và generation guard cho
 Python và multi-project wording đã sửa. Còn:
 
 - Roadmap vẫn đánh dấu Phase 1–3 hoàn tất dù active tasks còn nhiều.
-- Tests section chưa phản ánh 77 tests và coverage multi-project/migration/vector mới.
+- Tests section chưa phản ánh 85 tests và coverage multi-project/migration/vector mới.
 - Bổ sung schema migration, degraded semantics, health, project lifecycle và giới hạn hiện tại.
 
 ### P2-23 — UI project/explorer
@@ -250,75 +247,65 @@ Lệnh kiểm tra tối thiểu:
 ## CLAUDE_REPORT — temporary handoff
 
 <!-- CLAUDE_REPORT_START -->
-## Vòng: Batch B / P0-6 — project lifecycle concurrency (fail closed dưới lock)
+## Vòng: Batch B follow-up / P0-6 — đóng 2 race watcher pending-loss + overview stale-publish
 
 ### Commit / working tree
-- Work commit: `a2fff51` (runner.py, watcher.py, summarizer.py, tests/test_reconcile.py,
-  tests/test_watcher.py, tests/test_summarizer.py).
+- Work commit: `12094ea` (watcher.py, summarizer.py, db.py, tests/test_watcher.py, tests/test_summarizer.py).
 - Report commit: chính commit chứa thay đổi workspace.md này.
 - Working tree sau report commit: clean (chỉ còn data/ gitignored). Không push.
 
 ### Task ID đã xử lý
-- **Batch B / P0-6** — callback/job cũ chờ INDEX_LOCK rồi chạy với pid đã delete/switch → tạo lại
-  file/vector/overview mồ côi. Watcher/summarizer/reconcile phải **fail closed** khi project, watcher
-  generation hoặc file generation đã stale.
+- **Batch B follow-up / P0-6** — hai race còn lại:
+  1. Watcher pending-loss: `_flush(gen)` stale gọi `self._pending.clear()` → xóa mất pending của
+     generation hiện tại.
+  2. Overview stale publish: `build_overview()` chỉ check `project_exists` lúc commit → ghi lại
+     overview build từ summary đã cũ (file re-index giữa lúc `_ask`).
 
 ### File / schema / API đã đổi
 - `codemem/indexer/watcher.py`:
-  - Import thêm `from ..storage import db` và `INDEX_LOCK`.
-  - `_flush`: sau khi copy pending, **lấy INDEX_LOCK rồi RE-CHECK** `gen == self.generation` **và**
-    `db.project_exists(pid)` TRƯỚC mọi write (trước đây chỉ check generation trước khi chờ lock →
-    callback cũ vẫn ghi sau stop/switch/delete).
-- `codemem/indexer/runner.py`:
-  - `index_single_file` / `remove_file`: thêm guard `pid is None or not db.project_exists(pid)` →
-    return sớm (tự fail closed trong lock, không dựa caller). `remove_file` không còn ghi tombstone
-    mồ côi cho pid đã xóa.
-  - `reconcile_vectors`: guard đầu hàm (trước `ensure_embed_current`/Chroma) → trả
-    `{repaired:0, pending:0, tombstones_cleared:0, skipped:'project gone'}` cho pid không tồn tại.
+  - `_flush`: nhánh stale (`gen != self.generation`) giờ chỉ `return`, KHÔNG `self._pending.clear()`.
+    `stop()` đã clear pending ở mọi lần đổi generation, nên dict bị clear trước đây luôn thuộc
+    generation hiện tại → timer gen cũ không còn xóa pending mới của gen hiện tại.
+- `codemem/storage/db.py`:
+  - **`summaries_revision(project_id, limit=400)`**: fingerprint sha1 trên `(path, vector_gen, summary)`
+    của tập file có summary → đổi khi file re-index (summary bị xóa / vector_gen đổi) hoặc summary đổi.
 - `codemem/indexer/summarizer.py`:
-  - Import `INDEX_LOCK`. `run_summarize`: gọi LLM NGOÀI lock; trước khi commit summary/vector thì
-    **lấy INDEX_LOCK + re-check** `project_exists(pid)` và `file_vector_state[0] == snap_gen`. File
-    đã re-index (gen đổi)/xóa → drop kết quả cũ; project đã xóa → break cả job. `build_overview`:
-    `_ask` (LLM) ngoài lock, `set_overview` trong INDEX_LOCK + re-check project_exists.
+  - `build_overview`: snapshot `rev = db.summaries_revision(pid)` TRƯỚC `_ask` (LLM ngoài lock); trong
+    `INDEX_LOCK` chỉ `set_overview` khi `project_exists(pid)` **và** `summaries_revision(pid) == rev`.
+    Tập summary đổi giữa chừng → drop (không republish overview cũ).
 - Không đổi schema/SCHEMA_VERSION; không thêm/đổi route (vẫn 26).
 
 ### Lệnh test + kết quả
-- `PYTHONPATH=. PYTHONUTF8=1 python -m pytest tests -q` → **85 passed** (77 baseline + 8 mới; 2 test
-  reconcile cũ + 2 watcher cũ cập nhật cho guard project_exists).
+- `PYTHONPATH=. PYTHONUTF8=1 python -m pytest tests -q` → **87 passed** (85 baseline + 2 mới;
+  cập nhật test project-delete để assert thêm `get_overview()==''`).
 - `python -m compileall -q codemem` → pass; `node --check web/app.js` → pass.
-- Import smoke: server/watcher/summarizer import sạch (KHÔNG circular), 26 route.
 - Test mới:
-  - watcher: `test_flush_drops_when_project_deleted` (gen khớp + project gone → không ghi),
-    `test_flush_drops_when_generation_advances_after_copy` (switch ngay trước vùng ghi → re-check
-    trong lock bỏ).
-  - runner: `test_index_single_file_fails_closed_for_deleted_project`,
-    `test_remove_file_fails_closed_for_deleted_project` (không tombstone mồ côi),
-    `test_reconcile_vectors_fails_closed_for_deleted_project` (guard trước Chroma).
-  - summarizer: `test_run_summarize_commits_when_gen_matches` (happy path, vector summary gen đúng),
-    `test_run_summarize_drops_when_file_regenerated` (gen lệch → không ghi),
-    `test_run_summarize_stops_when_project_deleted` (project xóa → drop, không overview mồ côi).
+  - `tests/test_watcher.py::test_stale_flush_does_not_clear_current_pending` — generation=2 có pending
+    `{/new-generation.py}`, gọi `_flush(gen=1)` → `_pending` còn nguyên, không ghi.
+  - `tests/test_summarizer.py::test_build_overview_drops_when_summaries_change` — `_ask` re-index file
+    (summary xóa + gen mới) → `build_overview` trả text nhưng `get_overview(pid)==''` (revision đổi → drop).
+  - `tests/test_summarizer.py::test_run_summarize_stops_when_project_deleted` — bổ sung assert
+    `get_overview(pid)==''`.
 
 ### Smoke / integration evidence
-- Các test trên dùng DB thật (tmp) cho runner/summarizer (SQLite + tombstone side-effect kiểm tra
-  thực), vector bằng fake-call để xác nhận KHÔNG gọi Chroma khi stale. Watcher test deterministic
-  bằng monkeypatch generation/project_exists + lock wrapper (không cần observer thật).
-- Không chạy app full + Ollama vòng này (logic concurrency, không đổi schema).
+- Test dùng DB thật (tmp) cho overview (upsert/summary/revision/set_overview/get_overview thật); watcher
+  test deterministic (không cần observer/timer thật). Không chạy app full + Ollama (logic concurrency,
+  không đổi schema).
 
-### Partial / còn thiếu (KHÔNG thuộc Batch B — các Batch sau theo TASK DISTRIBUTION)
+### Partial / còn thiếu (các Batch sau theo TASK DISTRIBUTION)
 - **Batch C / P0-8** — versioned ledger, explicit transaction/recovery cho `files_new`,
   backup/rollback, interrupted-phase tests. CHƯA (batch kế).
 - **Batch D / P0-5+P0-10** — collection version theo embedding model, generation-gated Chroma
   publish/write-order, DB↔Chroma inventory/reconcile mọi project, summary pending/version state. CHƯA.
 - **Batch E / P0-10** — real-Chroma integration (`$lte`, missing generation, concurrent write order,
   delete→recreate), timeout/cancel/process isolation, live restart smoke. CHƯA.
-- **P0-6 còn lại**: lỗi mới vẫn `print` (chưa structured job log/retry) — Codex liệt kê như mục phụ;
-  vòng này tập trung fail-closed. Có thể gộp với job system P1-16 sau.
+- **P0-6 mục phụ** — lỗi mới vẫn `print` (chưa structured job log/retry); Codex đã xếp ở P1-16/P1-19,
+  không chặn Batch B. CHƯA.
 
 ### Regression / phát hiện mới
-- Không phát hiện regression mới. 85/85 xanh.
-- Lưu ý reviewer thứ tự lock: `_flush` lấy `self._lock` (copy pending) rồi NHẢ, sau đó mới lấy
-  `INDEX_LOCK`; KHÔNG giữ đồng thời hai lock → không deadlock với `stop()` (giữ INDEX_LOCK ở API rồi
-  gọi watcher.stop() lấy `self._lock`). Trong vùng INDEX_LOCK, `_flush` đọc `self.generation`/`project_id`
-  không qua `self._lock` (chỉ để re-check; đã có `project_exists` làm chốt an toàn). Summarizer giữ
-  INDEX_LOCK chỉ quanh phần commit (không quanh LLM) nên không block index lâu.
+- Không phát hiện regression mới. 87/87 xanh.
+- Lưu ý reviewer: lập luận an toàn của fix watcher dựa trên bất biến "`stop()` clear `_pending` ở mọi
+  lần đổi generation" → khi timer stale fire, `_pending` chỉ chứa pending của generation hiện tại (hoặc
+  rỗng), nên việc KHÔNG clear là đúng. `summaries_revision` query riêng (1 lần trước, 1 lần trong lock);
+  cùng WHERE với `all_file_summaries` nên fingerprint nhất quán với body đã gửi LLM.
 <!-- CLAUDE_REPORT_END -->
