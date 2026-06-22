@@ -200,6 +200,81 @@ def test_generation_unique_under_concurrency(tmp_path, monkeypatch):
     assert max(gens) - min(gens) == 7            # lien tuc tang (khong nhay/trung)
 
 
+def test_upsert_same_file_concurrent_newest_gen_wins(tmp_path, monkeypatch):
+    # #P0-10 (Batch A): hai writer cung /r/same.py -> allocation+mutation trong 1 transaction
+    # IMMEDIATE nen khong interleave; writer gen cao commit sau cung => row cuoi la cua gen cao
+    # (newest wins, gen thap KHONG ghi de). Repro cu cho ra hash gen-thap + vector_gen lui.
+    import threading
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "sf.db")
+    db.init_db()
+    pid = db.get_or_create_project("/r", "R")
+    results = {}
+    lock = threading.Lock()
+    barrier = threading.Barrier(2)
+
+    def w(name):
+        barrier.wait()
+        g = db.upsert_file("/r/same.py", "python", f"hash-{name}", f"skel-{name}", [], project_id=pid)
+        with lock:
+            results[name] = g
+    ta = threading.Thread(target=w, args=("A",))
+    tb = threading.Thread(target=w, args=("B",))
+    ta.start(); tb.start(); ta.join(); tb.join()
+    assert sorted(results.values()) == [1, 2]          # gen duy nhat, lien tuc
+    winner = max(results, key=results.get)             # writer nhan gen cao nhat
+    row = db.get_file_row("/r/same.py", project_id=pid)
+    assert row["vector_gen"] == 2                       # gen khong lui
+    assert row["hash"] == f"hash-{winner}"             # content = writer gen cao (newest wins)
+
+
+def test_upsert_rolls_back_on_failure(tmp_path, monkeypatch):
+    # #P0-10 (Batch A): loi giua allocation va write (symbol thieu key) -> ROLLBACK toan bo:
+    # gen KHONG bi consume, file loi khong ghi 1 phan, DB khong bi khoa (upsert sau van chay).
+    import pytest
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "rb.db")
+    db.init_db()
+    pid = db.get_or_create_project("/r", "R")
+    before = db.upsert_file("/r/a.py", "python", "h", "s", [], project_id=pid)   # gen 1
+    with pytest.raises(KeyError):
+        db.upsert_file("/r/b.py", "python", "h", "s", [{"name": "x"}], project_id=pid)  # thieu 'kind'
+    conn = db._conn()
+    seq = int(conn.execute("SELECT value FROM meta WHERE key='vec_gen_seq'").fetchone()["value"])
+    b = conn.execute("SELECT 1 FROM files WHERE project_id=? AND path='/r/b.py'", (pid,)).fetchone()
+    conn.close()
+    assert seq == before                                # gen da rollback (khong tang)
+    assert b is None                                    # file loi khong duoc ghi
+    after = db.upsert_file("/r/c.py", "python", "h", "s", [], project_id=pid)
+    assert after == before + 1                          # DB khong khoa, monotonic lien tuc
+
+
+def test_reserve_and_upsert_concurrent_unique_gens(tmp_path, monkeypatch):
+    # #P0-10 (Batch A): reserve_file_generation dua voi upsert_file -> gen van duy nhat
+    import threading
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "ru.db")
+    db.init_db()
+    pid = db.get_or_create_project("/r", "R")
+    db.upsert_file("/r/x.py", "python", "h", "s", [], project_id=pid)   # co row cho reserve update
+    gens = []
+    lock = threading.Lock()
+    bar = threading.Barrier(2)
+
+    def up():
+        bar.wait()
+        g = db.upsert_file("/r/y.py", "python", "h", "s", [], project_id=pid)
+        with lock:
+            gens.append(g)
+
+    def res():
+        bar.wait()
+        g = db.reserve_file_generation("/r/x.py", pid)
+        with lock:
+            gens.append(g)
+    t1 = threading.Thread(target=up)
+    t2 = threading.Thread(target=res)
+    t1.start(); t2.start(); t1.join(); t2.join()
+    assert len(gens) == 2 and len(set(gens)) == 2       # khong trung gen
+
+
 def test_init_repairs_malformed_generation_meta(tmp_path, monkeypatch):
     # #P0-10: vec_gen_seq='broken' -> init_db KHONG raise ValueError, repair tu max thuc te
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "mal.db")

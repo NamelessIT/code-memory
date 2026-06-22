@@ -424,42 +424,50 @@ def get_indexed_hashes(project_id) -> dict:
 
 
 def upsert_file(path, lang, file_hash, skeleton, symbols, edges=None, routes=None, project_id=None):
-    """Ghi file vao SQLite. vector_ok=0 + bump vector_gen TRONG CUNG transaction (#P0-5/#P0-10):
-    - crash giua upsert va embedding -> vector_ok=0 (reconcile se sua), khong bao gia 'da co vector'.
-    - vector_gen tang don dieu -> intent xoa cu (gen thap) khong xoa vector moi (gen cao).
-    Tra ve generation de caller tag vector."""
-    gen = allocate_generation()              # atomic, monotonic (#P0-10) - truoc khi mo conn ghi file
-    conn = _conn()
+    """Cap generation + ghi files/symbols/edges/routes/overview-invalidate TRONG MOT transaction
+    IMMEDIATE (#P0-10): giu write-lock tu luc cap gen den khi commit. Hai writer (cung HOAC khac file)
+    khong interleave -> writer gen thap hoan tat sau KHONG ghi de row/content cua gen cao (newest wins),
+    child rows (symbols/edges/routes) cung nam trong cung transaction. vector_ok=0 (reconcile sua sau);
+    loi giua chung -> ROLLBACK (khong consume gen, khong ghi 1 phan). Tra ve generation."""
+    conn = _immediate_conn()
     now = datetime.now().isoformat()
-    # Identity = (project_id, path) -> project long nhau khong ghi de nhau
-    conn.execute(
-        "INSERT INTO files(project_id, path, lang, hash, skeleton, indexed_at, summary, vector_ok, vector_gen) "
-        "VALUES (?,?,?,?,?,?,'',0,?) "
-        "ON CONFLICT(project_id, path) DO UPDATE SET lang=?, hash=?, skeleton=?, indexed_at=?, "
-        "summary='', vector_ok=0, vector_gen=?",
-        (project_id, path, lang, file_hash, skeleton, now, gen, lang, file_hash, skeleton, now, gen),
-    )
-    conn.execute("DELETE FROM symbols WHERE project_id=? AND file_path=?", (project_id, path))
-    conn.executemany(
-        "INSERT INTO symbols(project_id, file_path, kind, name, signature, start_line, end_line, parent, exported, tag, doc, body) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-        [(project_id, path, s["kind"], s["name"], s["signature"], s["start_line"], s["end_line"],
-          s.get("parent"), 1 if s.get("exported") else 0, s.get("tag", ""), s.get("doc", ""), s.get("body", ""))
-         for s in symbols],
-    )
-    conn.execute("DELETE FROM edges WHERE project_id=? AND file_path=?", (project_id, path))
-    if edges:
-        conn.executemany("INSERT INTO edges(project_id, file_path, caller, callee) VALUES (?,?,?,?)",
-                         [(project_id, path, e["caller"], e["callee"]) for e in edges])
-    conn.execute("DELETE FROM routes WHERE project_id=? AND file_path=?", (project_id, path))
-    if routes:
-        conn.executemany("INSERT INTO routes(project_id, file_path, method, path, handler, line) VALUES (?,?,?,?,?,?)",
-                         [(project_id, path, r["method"], r["path"], r.get("handler", ""), r.get("line")) for r in routes])
-    # File doi -> overview cua project thanh stale
-    conn.execute("DELETE FROM meta WHERE key=?", (f"overview:{project_id}",))
-    conn.commit()
-    conn.close()
-    return gen
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            gen = _alloc_gen_locked(conn)
+            # Identity = (project_id, path) -> project long nhau khong ghi de nhau
+            conn.execute(
+                "INSERT INTO files(project_id, path, lang, hash, skeleton, indexed_at, summary, vector_ok, vector_gen) "
+                "VALUES (?,?,?,?,?,?,'',0,?) "
+                "ON CONFLICT(project_id, path) DO UPDATE SET lang=?, hash=?, skeleton=?, indexed_at=?, "
+                "summary='', vector_ok=0, vector_gen=?",
+                (project_id, path, lang, file_hash, skeleton, now, gen, lang, file_hash, skeleton, now, gen),
+            )
+            conn.execute("DELETE FROM symbols WHERE project_id=? AND file_path=?", (project_id, path))
+            conn.executemany(
+                "INSERT INTO symbols(project_id, file_path, kind, name, signature, start_line, end_line, parent, exported, tag, doc, body) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                [(project_id, path, s["kind"], s["name"], s["signature"], s["start_line"], s["end_line"],
+                  s.get("parent"), 1 if s.get("exported") else 0, s.get("tag", ""), s.get("doc", ""), s.get("body", ""))
+                 for s in symbols],
+            )
+            conn.execute("DELETE FROM edges WHERE project_id=? AND file_path=?", (project_id, path))
+            if edges:
+                conn.executemany("INSERT INTO edges(project_id, file_path, caller, callee) VALUES (?,?,?,?)",
+                                 [(project_id, path, e["caller"], e["callee"]) for e in edges])
+            conn.execute("DELETE FROM routes WHERE project_id=? AND file_path=?", (project_id, path))
+            if routes:
+                conn.executemany("INSERT INTO routes(project_id, file_path, method, path, handler, line) VALUES (?,?,?,?,?,?)",
+                                 [(project_id, path, r["method"], r["path"], r.get("handler", ""), r.get("line")) for r in routes])
+            # File doi -> overview cua project thanh stale
+            conn.execute("DELETE FROM meta WHERE key=?", (f"overview:{project_id}",))
+            conn.execute("COMMIT")
+            return gen
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    finally:
+        conn.close()
 
 
 def delete_file(path, project_id=None):
@@ -512,25 +520,37 @@ def set_vector_ok(path, ok, project_id):
     conn.close()
 
 
+def _immediate_conn():
+    """Connection autocommit (tu quan ly BEGIN IMMEDIATE/COMMIT/ROLLBACK) + busy_timeout (#P0-10)."""
+    conn = sqlite3.connect(str(DB_PATH), isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=5000")
+    return conn
+
+
+def _alloc_gen_locked(conn):
+    """Tinh + ghi generation moi TRONG transaction IMMEDIATE da mo cua caller (KHONG commit).
+    gen = max(meta.vec_gen_seq, MAX(files.vector_gen), MAX(vector_tombstones.generation)) + 1.
+    Chong tut gen sau restore/import lam mat/stale/malformed meta (#P0-10)."""
+    row = conn.execute("SELECT value FROM meta WHERE key='vec_gen_seq'").fetchone()
+    seq = _safe_int(row["value"] if row else None)
+    fmax = conn.execute("SELECT COALESCE(MAX(vector_gen),0) m FROM files").fetchone()["m"]
+    tmax = conn.execute("SELECT COALESCE(MAX(generation),0) m FROM vector_tombstones").fetchone()["m"]
+    gen = max(seq, fmax, tmax) + 1
+    conn.execute("INSERT INTO meta(key,value) VALUES('vec_gen_seq',?) "
+                 "ON CONFLICT(key) DO UPDATE SET value=?", (str(gen), str(gen)))
+    return gen
+
+
 def allocate_generation():
     """Cap generation duy nhat, tang nghiem ngat, ATOMIC giua nhieu connection/process (#P0-10).
-    gen = max(meta.vec_gen_seq, MAX(files.vector_gen), MAX(vector_tombstones.generation)) + 1.
-    Dung connection rieng (autocommit) + BEGIN IMMEDIATE: giu write-lock TRUOC khi doc MAX -> hai
-    writer dong thoi khong doc cung max (khong tai su dung gen). busy_timeout cho cho lock.
-    Chong tut gen sau restore/import lam mat/stale/malformed meta. Connection luon dong."""
-    conn = sqlite3.connect(str(DB_PATH), isolation_level=None)   # autocommit -> tu quan ly BEGIN/COMMIT
-    conn.row_factory = sqlite3.Row
+    BEGIN IMMEDIATE giu write-lock TRUOC khi doc MAX -> hai writer khong doc cung max. Connection
+    luon dong; loi -> ROLLBACK."""
+    conn = _immediate_conn()
     try:
-        conn.execute("PRAGMA busy_timeout=5000")
-        conn.execute("BEGIN IMMEDIATE")          # lay write-lock ngay -> doc-sua-ghi atomic
+        conn.execute("BEGIN IMMEDIATE")
         try:
-            row = conn.execute("SELECT value FROM meta WHERE key='vec_gen_seq'").fetchone()
-            seq = _safe_int(row["value"] if row else None)
-            fmax = conn.execute("SELECT COALESCE(MAX(vector_gen),0) m FROM files").fetchone()["m"]
-            tmax = conn.execute("SELECT COALESCE(MAX(generation),0) m FROM vector_tombstones").fetchone()["m"]
-            gen = max(seq, fmax, tmax) + 1
-            conn.execute("INSERT INTO meta(key,value) VALUES('vec_gen_seq',?) "
-                         "ON CONFLICT(key) DO UPDATE SET value=?", (str(gen), str(gen)))
+            gen = _alloc_gen_locked(conn)
             conn.execute("COMMIT")
             return gen
         except Exception:
@@ -541,23 +561,31 @@ def allocate_generation():
 
 
 def reserve_file_generation(path, project_id):
-    """Cap generation moi (atomic) + gan cho file. Tra ve generation moi (>0).
-    Dung khi reconcile file legacy vector_gen=0 -> cap generation that TRUOC khi ghi vector,
-    de vector metadata + DB khong con gen0 (#P0-5)."""
-    gen = allocate_generation()
-    conn = _conn()
-    conn.execute("UPDATE files SET vector_gen=? WHERE project_id=? AND path=?", (gen, project_id, path))
-    conn.commit()
-    conn.close()
-    return gen
+    """Cap generation moi + gan cho file TRONG MOT transaction IMMEDIATE (#P0-10): giu write-lock
+    tu luc cap gen den khi commit -> khong dua voi upsert/reserve khac. Tra ve generation moi (>0).
+    Dung khi reconcile file legacy vector_gen=0 -> cap gen that truoc khi ghi vector (#P0-5)."""
+    conn = _immediate_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            gen = _alloc_gen_locked(conn)
+            conn.execute("UPDATE files SET vector_gen=? WHERE project_id=? AND path=?",
+                         (gen, project_id, path))
+            conn.execute("COMMIT")
+            return gen
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    finally:
+        conn.close()
 
 
-def set_vector_ok_if_gen(path, project_id, generation):
-    """Set vector_ok=1 CHI khi files.vector_gen == generation (vector vua ghi van la moi nhat).
-    Tranh danh dau OK cho vector cu khi da co re-index gen cao hon (#P0-5). Tra True neu da set."""
+def set_vector_ok_if_gen(path, project_id, generation, ok=True):
+    """Set vector_ok=ok CHI khi files.vector_gen == generation (vector vua xu ly van la moi nhat).
+    Tranh writer gen cu ghi de trang thai vector cua gen moi hon (#P0-5/#P0-10). Tra True neu da set."""
     conn = _conn()
-    cur = conn.execute("UPDATE files SET vector_ok=1 WHERE project_id=? AND path=? AND vector_gen=?",
-                       (project_id, path, generation))
+    cur = conn.execute("UPDATE files SET vector_ok=? WHERE project_id=? AND path=? AND vector_gen=?",
+                       (1 if ok else 0, project_id, path, generation))
     changed = cur.rowcount
     conn.commit()
     conn.close()

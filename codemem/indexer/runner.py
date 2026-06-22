@@ -36,7 +36,8 @@ def _index_one(spath, lang, h, root, pid, progress=None):
     skeleton = build_skeleton(rel, r["symbols"], r["imports"])
     gen = db.upsert_file(spath, lang, h, skeleton, r["symbols"], r["edges"], r["routes"], project_id=pid)
     vec_ok = vectors.index_file(spath, lang, skeleton, r["symbols"], project_id=pid, generation=gen)
-    db.set_vector_ok(spath, vec_ok, pid)   # vector that bai -> danh dau de reconcile sau
+    # Conditional theo gen: writer gen cu hoan tat sau KHONG ghi de vector-state cua gen moi hon (#P0-10)
+    db.set_vector_ok_if_gen(spath, pid, gen, vec_ok)
     if progress:
         progress(f"indexed {spath} ({len(r['symbols'])} symbols, vector={'ok' if vec_ok else 'pending'})")
     return vec_ok
