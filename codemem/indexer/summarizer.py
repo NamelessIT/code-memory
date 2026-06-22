@@ -11,6 +11,7 @@ import ollama
 
 from ..config import MODEL, OLLAMA_URL, NUM_CTX
 from ..storage import db, vectors
+from .runner import INDEX_LOCK
 
 _client = ollama.Client(host=OLLAMA_URL)
 
@@ -57,9 +58,13 @@ def build_overview(project_id=None):
         return ""
     import os
     body = "\n".join(f"- {os.path.basename(s['path'])}: {s['summary']}" for s in sums)[:8000]
-    ov = _ask(_OVERVIEW_SYS, f"Tóm tắt các file:\n{body}", max_ctx=NUM_CTX)
+    ov = _ask(_OVERVIEW_SYS, f"Tóm tắt các file:\n{body}", max_ctx=NUM_CTX)   # LLM ngoai lock
     if ov:
-        db.set_overview(ov, project_id=project_id)
+        # Commit overview trong INDEX_LOCK + re-check project con ton tai (#P0-6): job co the chay
+        # sau khi project bi delete -> KHONG ghi overview mo coi cho pid khong con.
+        with INDEX_LOCK:
+            if db.project_exists(project_id):
+                db.set_overview(ov, project_id=project_id)
     return ov or ""
 
 
@@ -75,13 +80,24 @@ def run_summarize(make_overview=True):
         files = db.files_needing_summary(project_id=pid)
         progress["total"] = len(files)
         for f in files:
-            summ = summarize_file(f["skeleton"] or "")
-            if summ:                       # chi luu summary hop le
-                db.set_file_summary(f["path"], summ, project_id=pid)
-                vectors.index_summary(f["path"], f["lang"], summ, project_id=pid,
-                                      generation=f.get("vector_gen", 0))
-            else:
+            snap_gen = f.get("vector_gen", 0)
+            summ = summarize_file(f["skeleton"] or "")   # LLM ngoai lock
+            if not summ:                   # khong luu chuoi loi lam summary
                 progress["errors"] += 1
+                progress["done"] += 1
+                continue
+            # Commit summary/vector trong INDEX_LOCK + re-check (#P0-6): truoc khi ghi, file co the
+            # da bi re-index (vector_gen doi) hoac project/file da xoa. Drop ket qua cu -> khong ghi
+            # summary/vector mo coi hoac de len noi dung moi.
+            with INDEX_LOCK:
+                if not db.project_exists(pid):
+                    break                  # project da xoa -> dung han job
+                st = db.file_vector_state(f["path"], pid)
+                if st is None or st[0] != snap_gen:
+                    progress["done"] += 1  # file da re-index/xoa -> bo summary cu
+                    continue
+                db.set_file_summary(f["path"], summ, project_id=pid)
+                vectors.index_summary(f["path"], f["lang"], summ, project_id=pid, generation=snap_gen)
             progress["done"] += 1
         if make_overview:
             progress["phase"] = "overview"

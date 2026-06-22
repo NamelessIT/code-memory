@@ -3,9 +3,10 @@ import codemem.indexer.runner as runner
 
 
 def _isolate(monkeypatch):
-    """Tach reconcile khoi DB that: bo qua embed-check + tombstone."""
+    """Tach reconcile khoi DB that: bo qua embed-check + tombstone + coi project ton tai."""
     monkeypatch.setattr(runner, "ensure_embed_current", lambda: False)
     monkeypatch.setattr(runner, "_retry_tombstones", lambda *a, **k: 0)
+    monkeypatch.setattr(runner.db, "project_exists", lambda pid: True)   # #P0-6 guard: gia lap ton tai
 
 
 def test_reconcile_repairs_pending(monkeypatch):
@@ -193,6 +194,44 @@ def test_cleanup_scheduler_stop_keeps_reference_when_stuck(monkeypatch):
         release.set()
         assert runner.stop_cleanup_scheduler(timeout=2.0) is True
     assert runner._cleanup_thread is None             # dung sach sau khi worker tha
+
+
+def test_index_single_file_fails_closed_for_deleted_project(tmp_path, monkeypatch):
+    # #P0-6: callback cu chay sau delete/switch -> KHONG re-tao file/vector cho project khong ton tai
+    import codemem.storage.db as db
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "isf.db")
+    db.init_db()
+    f = tmp_path / "a.py"
+    f.write_text("def x():\n    return 1\n")
+    called = []
+    monkeypatch.setattr(runner.vectors, "index_file", lambda *a, **k: called.append(1) or True)
+    assert runner.index_single_file(str(f), project_id=99999) is False
+    assert called == []                                 # khong ghi vector cho project da xoa
+
+
+def test_remove_file_fails_closed_for_deleted_project(tmp_path, monkeypatch):
+    # #P0-6: remove cho project da xoa -> khong ghi tombstone mo coi, khong goi vector delete
+    import codemem.storage.db as db
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "rmf.db")
+    db.init_db()
+    deleted = []
+    monkeypatch.setattr(runner.vectors, "delete_file", lambda *a, **k: deleted.append(1) or True)
+    runner.remove_file("/r/x.py", project_id=88888)
+    assert deleted == []
+    assert db.tombstone_stats()["pending"] == 0
+
+
+def test_reconcile_vectors_fails_closed_for_deleted_project(tmp_path, monkeypatch):
+    # #P0-6: reconcile thread stale pid -> guard truoc ensure_embed_current/Chroma
+    import codemem.storage.db as db
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "rcv.db")
+    db.init_db()
+    calls = []
+    monkeypatch.setattr(runner, "ensure_embed_current", lambda: calls.append("embed"))
+    monkeypatch.setattr(runner.vectors, "index_file", lambda *a, **k: calls.append("idx") or True)
+    res = runner.reconcile_vectors(77777)
+    assert res.get("skipped") == "project gone"
+    assert calls == []                                  # khong dung Chroma cho pid da xoa
 
 
 def test_cleanup_scheduler_status_detects_stuck(monkeypatch):

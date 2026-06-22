@@ -191,6 +191,10 @@ def reconcile_all_projects(progress=None, include_collection=True):
 def reconcile_vectors(pid, progress=None, include_collection=True):
     """Repair vector pending/thieu + retry tombstone (#P0-5/#P0-10).
     include_collection=False khi goi ngay sau index (fence: khong wipe collection vua ghi)."""
+    # Fail closed (#P0-6): thread reconcile co the cho INDEX_LOCK roi chay voi pid da bi delete/switch.
+    # Re-check trong lock; pid khong con -> khong dung Chroma, khong tao vector/intent mo coi.
+    if pid is None or not db.project_exists(pid):
+        return {"repaired": 0, "pending": 0, "tombstones_cleared": 0, "skipped": "project gone"}
     ensure_embed_current()
     scopes = None if include_collection else {"file", "project"}
     tomb = _retry_tombstones(scopes=scopes)
@@ -280,7 +284,9 @@ def index_single_file(path: str, project_id=None):
     if not lang or not p.is_file():
         return False
     pid = project_id if project_id is not None else db.active_project_id()
-    if pid is None:
+    # Fail closed (#P0-6): callback cu cho INDEX_LOCK roi chay sau delete/switch -> KHONG re-tao file
+    # cho project da xoa. Tu kiem tra trong lock, khong dua vao caller.
+    if pid is None or not db.project_exists(pid):
         return False
     root = db.get_project_root(pid) or str(p.parent)
     try:
@@ -295,6 +301,9 @@ def index_single_file(path: str, project_id=None):
 def remove_file(path: str, project_id=None):
     """Go 1 file khoi index (file bi xoa). Bind project_id co dinh."""
     pid = project_id if project_id is not None else db.active_project_id()
+    # Fail closed (#P0-6): project da delete/switch -> KHONG ghi tombstone mo coi cho pid da xoa.
+    if pid is None or not db.project_exists(pid):
+        return
     sp = os.path.normcase(str(Path(path)))
     db.delete_file(sp, project_id=pid)           # ghi intent atomic (outbox)
     if vectors.delete_file(sp, project_id=pid):

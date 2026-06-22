@@ -3,8 +3,9 @@ import threading
 from pathlib import Path
 
 from ..config import IGNORE_DIRS
+from ..storage import db
 from .walker import detect_lang
-from .runner import index_single_file, remove_file
+from .runner import index_single_file, remove_file, INDEX_LOCK
 
 try:
     from watchdog.observers import Observer
@@ -106,14 +107,20 @@ class WatcherManager:
             pid = self.project_id
             pending = dict(self._pending)
             self._pending.clear()
-        for path, deleted in pending.items():
-            try:
-                if deleted:
-                    remove_file(path, project_id=pid)
-                else:
-                    index_single_file(path, project_id=pid)
-            except Exception as e:
-                print(f"[warn] watcher flush {path}: {e}")
+        # Lay INDEX_LOCK roi RE-CHECK generation + project ton tai TRUOC moi write (#P0-6):
+        # giua luc copy pending va luc ghi co the da stop/switch/delete (op do giu INDEX_LOCK). Neu
+        # khong re-check, callback cu se re-tao file/vector cho project da doi/xoa.
+        with INDEX_LOCK:
+            if gen != self.generation or pid is None or not db.project_exists(pid):
+                return                   # stale: bo, khong ghi
+            for path, deleted in pending.items():
+                try:
+                    if deleted:
+                        remove_file(path, project_id=pid)
+                    else:
+                        index_single_file(path, project_id=pid)
+                except Exception as e:
+                    print(f"[warn] watcher flush {path}: {e}")
 
 
 manager = WatcherManager()
