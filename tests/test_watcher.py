@@ -14,6 +14,20 @@ def test_stale_flush_skipped(monkeypatch):
     assert calls == []
 
 
+def test_stale_flush_does_not_clear_current_pending(monkeypatch):
+    # #P0-6 repro: timer cu (gen 1) chay khi generation da la 2 voi pending moi -> KHONG duoc clear
+    # pending cua generation hien tai (truoc day stale branch goi _pending.clear() -> mat du lieu).
+    calls = []
+    monkeypatch.setattr(w, "index_single_file", lambda path, project_id=None: calls.append(path))
+    m = w.WatcherManager()
+    m.generation = 2
+    m.project_id = 5
+    m._pending = {"/new-generation.py": False}   # pending cua generation hien tai (2)
+    m._flush(gen=1)                              # stale timer gen 1
+    assert m._pending == {"/new-generation.py": False}   # van con nguyen
+    assert calls == []                           # stale -> khong ghi
+
+
 def test_flush_binds_project_id(monkeypatch):
     calls = []
     monkeypatch.setattr(w, "index_single_file", lambda path, project_id=None: calls.append((path, project_id)))

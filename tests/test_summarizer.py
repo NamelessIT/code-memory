@@ -71,3 +71,24 @@ def test_run_summarize_stops_when_project_deleted(tmp_path, monkeypatch):
     sm.run_summarize(make_overview=True)
     assert idx == []
     assert db.get_file_summary("/r/x.py", project_id=pid) == ""
+    assert db.get_overview(pid) == ""                   # khong ghi overview mo coi
+
+
+def test_build_overview_drops_when_summaries_change(tmp_path, monkeypatch):
+    # #P0-6 repro: _ask keo dai, trong khi do file bi re-index (summary xoa + vector_gen doi) ->
+    # overview build tu OLD SUMMARY la stale -> KHONG set_overview.
+    import codemem.storage.db as db
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "ov.db")
+    db.init_db()
+    pid = db.get_or_create_project("/r", "R")
+    db.upsert_file("/r/x.py", "python", "h", "skel", [], project_id=pid)
+    db.set_file_summary("/r/x.py", "OLD SUMMARY", project_id=pid)
+
+    def fake_ask(system, user, max_ctx=4096):
+        # mo phong: trong luc goi LLM, file bi re-index -> summary='' + vector_gen moi -> revision doi
+        db.upsert_file("/r/x.py", "python", "h2", "skel2", [], project_id=pid)
+        return "OVERVIEW TU OLD SUMMARY"
+    monkeypatch.setattr(sm, "_ask", fake_ask)
+    out = sm.build_overview(project_id=pid)
+    assert out == "OVERVIEW TU OLD SUMMARY"             # ham van tra text
+    assert db.get_overview(pid) == ""                   # nhung KHONG publish vi revision doi

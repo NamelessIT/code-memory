@@ -101,9 +101,8 @@ class WatcherManager:
 
     def _flush(self, gen):
         with self._lock:
-            if gen != self.generation:   # da switch/stop -> bo, KHONG ghi vao project moi
-                self._pending.clear()
-                return
+            if gen != self.generation:   # timer stale (da switch/stop) -> CHI bo phan cua minh.
+                return                    # KHONG clear _pending: do la pending cua generation hien tai
             pid = self.project_id
             pending = dict(self._pending)
             self._pending.clear()

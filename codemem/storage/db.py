@@ -917,6 +917,23 @@ def all_file_summaries(limit=400, project_id=None):
     return [dict(r) for r in rows]
 
 
+def summaries_revision(project_id=None, limit=400):
+    """Fingerprint on dinh cua tap summary dung de build overview (#P0-6). Doi khi file re-index
+    (summary bi xoa hoac vector_gen doi) hoac noi dung summary doi -> revision doi -> overview build
+    tu snapshot cu tro thanh stale, phai drop truoc set_overview."""
+    import hashlib
+    conn = _conn()
+    pid = project_id if project_id is not None else _active_pid(conn)
+    rows = conn.execute(
+        "SELECT path, vector_gen, summary FROM files WHERE project_id=? AND COALESCE(summary,'')<>'' "
+        "ORDER BY path LIMIT ?", (pid, limit)).fetchall()
+    conn.close()
+    h = hashlib.sha1()
+    for r in rows:
+        h.update(f"{r['path']}\x00{r['vector_gen']}\x00{r['summary']}\x00".encode("utf-8", "replace"))
+    return h.hexdigest()
+
+
 def summary_counts(project_id=None):
     conn = _conn()
     pid = project_id if project_id is not None else _active_pid(conn)

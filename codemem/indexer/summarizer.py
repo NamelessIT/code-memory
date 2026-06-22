@@ -56,14 +56,16 @@ def build_overview(project_id=None):
     sums = db.all_file_summaries(limit=400, project_id=project_id)
     if not sums:
         return ""
+    rev = db.summaries_revision(project_id=project_id)   # snapshot truoc LLM (#P0-6)
     import os
     body = "\n".join(f"- {os.path.basename(s['path'])}: {s['summary']}" for s in sums)[:8000]
     ov = _ask(_OVERVIEW_SYS, f"Tóm tắt các file:\n{body}", max_ctx=NUM_CTX)   # LLM ngoai lock
     if ov:
-        # Commit overview trong INDEX_LOCK + re-check project con ton tai (#P0-6): job co the chay
-        # sau khi project bi delete -> KHONG ghi overview mo coi cho pid khong con.
+        # Commit overview trong INDEX_LOCK + re-check project con ton tai VA tap summary chua doi
+        # (#P0-6): _ask co the keo dai trong khi file re-index (xoa summary, invalidate overview) ->
+        # overview build tu summary cu la stale, KHONG duoc ghi de.
         with INDEX_LOCK:
-            if db.project_exists(project_id):
+            if db.project_exists(project_id) and db.summaries_revision(project_id=project_id) == rev:
                 db.set_overview(ov, project_id=project_id)
     return ov or ""
 
