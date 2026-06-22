@@ -28,12 +28,24 @@
 
 ## Baseline đã được Codex xác minh
 
-- Reviewed implementation commit: d26eeae; report commit: 5590bfe.
-- Full suite: 72 passed.
+- Reviewed implementation commit: 4c8652b; report commit: 557dfa8.
+- Full suite: 74 passed.
 - python -m compileall -q codemem: pass.
 - node --check web/app.js: pass.
-- P0 đã xác minh và đã xóa/thu gọn: reconcile-all duyệt mọi project; legacy gen0 được cấp generation thật; startup repair `vec_gen_seq` khi meta thiếu/thấp nhưng vẫn là số; scheduler cleanup chạy lặp, không tạo duplicate worker và health phân biệt running/busy/stuck; shutdown hook cơ bản và các fix vòng trước.
+- P0 đã xác minh và đã xóa/thu gọn: reconcile-all duyệt mọi project; legacy gen0 được cấp generation thật; startup repair `vec_gen_seq` thiếu/thấp/malformed và đóng connection khi init lỗi; generation allocation dùng `BEGIN IMMEDIATE` nên không cấp trùng giữa nhiều connection; scheduler cleanup chạy lặp, không tạo duplicate worker và health phân biệt running/busy/stuck; shutdown hook cơ bản và các fix vòng trước.
 - Không được làm regression các phần trên.
+
+## TASK DISTRIBUTION — thứ tự triển khai
+
+Claude Code chỉ nhận **một batch tại một thời điểm**, ghi báo cáo và chờ Codex audit trước khi sang batch kế. Không gộp UI/P1 vào batch P0.
+
+1. **NOW — Batch A / P0-10: atomic allocation + mutation cùng transaction.** Sửa race cùng file được mô tả trong P0-10; thêm deterministic same-file race test, giữ test 8 writer khác file và malformed-meta. Đây là task duy nhất của vòng kế tiếp.
+2. **NEXT — Batch B / P0-6: project lifecycle concurrency.** Re-check watcher generation/project existence sau lock; đưa summarizer vào cùng conflict policy; test delete/switch trong lúc callback/job đang chờ.
+3. **THEN — Batch C / P0-8: migration recovery.** Versioned ledger, explicit transaction/recovery cho `files_new`, backup/rollback contract và interrupted-phase tests.
+4. **AFTER — Batch D / P0-5 + P0-10: vector truth/inventory.** Collection version theo embedding model, DB↔Chroma inventory/reconcile mọi project và summary state.
+5. **LAST P0 — Batch E / P0-10: Chroma execution boundary.** Real-Chroma integration (`$lte`, missing generation, delete→recreate), timeout/cancel/process isolation và live restart smoke. Chỉ làm sau khi Batch A–D ổn định.
+
+Codex tiếp tục vai trò audit: chạy repro độc lập, full suite, xóa phần đã đạt và phân phối batch kế.
 
 ## ACTIVE TASKS
 
@@ -72,8 +84,8 @@ roots_canon_v2, normcase dedup, overview invalidation và cleanup intent cùng t
 
 Atomic clear, SQL scope filter, forced collection fence và generation guard cho vector mới đã đạt. Các lỗi còn lại:
 
-- `_next_generation()` đã lấy max từ meta/files/tombstones nhưng **chưa atomic ở cấp SQLite**: các `SELECT MAX(...)` chạy trước write transaction. Codex repro thật với 8 thread gọi `upsert_file()` đồng thời trả `[1,1,1,1,2,2,2,2]`, không exception; generation bị tái sử dụng. `INDEX_LOCK` chỉ serialize một process và không bảo vệ direct DB call/multiple worker. Cần `BEGIN IMMEDIATE`/atomic counter allocation phù hợp, busy retry, và test nhiều connection ghi cùng lúc (đặc biệt cùng file) bảo đảm generation duy nhất, tăng nghiêm ngặt và connection luôn đóng.
-- `init_db()` và `_next_generation()` gọi `int(meta.vec_gen_seq)` trực tiếp. Codex repro `vec_gen_seq='broken'` → startup `ValueError`; connection của `init_db()` không được đóng nên file DB còn bị khóa trên Windows. Restore/migration phải coi meta thiếu, thấp **hoặc malformed** là dữ liệu cần repair từ max thực tế; rollback/close deterministically và thêm regression test.
+- `allocate_generation()` đã cấp generation duy nhất bằng connection riêng + `BEGIN IMMEDIATE`, nhưng commit allocation **trước** transaction mutation của `upsert_file()`/`reserve_file_generation()`. Codex deterministic repro cùng `/r/same.py`: writer A nhận gen 1 rồi bị pause; writer B nhận gen 2 và commit; A resume và commit sau → kết quả DB `hash='older', vector_gen=1` dù global sequence=2. Generation/file state vẫn quay lùi và child symbols/routes cũng có thể bị writer cũ ghi đè.
+- Batch A acceptance: giữ write lock từ allocation qua toàn bộ mutation file/symbol/edge/route (hoặc dùng conditional stale-write rejection bao phủ cả child rows), rollback/close chắc chắn; writer gen thấp hoàn tất sau không được đổi row/content/vector state mới hơn. Thêm deterministic same-file out-of-order test như repro trên, concurrent different-file test, failure-between-allocation-and-write test và test `reserve_file_generation` đua với upsert. Nếu tuyên bố hỗ trợ multi-process, `_index_one` cũng phải dùng conditional `set_vector_ok_if_gen` và nêu rõ policy cho vector write cũ hoàn tất sau; nếu không hỗ trợ thì enforce single-writer process thay vì chỉ ghi chú.
 - Chroma trước vòng này có 9 vectors thiếu generation; SQLite marker không tự normalize Chroma. Startup đã reconcile mọi project nhưng chưa có inventory/migration job đối chiếu DB↔Chroma và trạng thái tiến độ.
 - Summary generation query đã sửa, nhưng DB summary vẫn không có pending/version state và summarizer race với re-index/delete chưa được bảo vệ.
 - Viết integration test bằng Chroma thật cho missing-field + `$lte`, delete→recreate, summary delete và canonical cleanup; fake collection chỉ xác nhận shape where, không xác nhận match/delete semantics. Codex smoke `$lte` trên collection local không hoàn tất trong >30s, cần kiểm tra timeout/performance/lock thay vì để cleanup treo INDEX_LOCK.
@@ -153,7 +165,7 @@ Atomic clear, SQL scope filter, forced collection fence và generation guard cho
 - Watcher chỉ trả boolean, không root/project/generation/error.
 - Dùng FastAPI lifespan để shutdown watcher/job sạch.
 - Structured logs có request/job/project ID; bỏ except: pass ở critical path.
-- SQLite helpers chưa dùng context manager/try-finally; Codex đã repro cả `upsert` OperationalError và `init_db` ValueError từ malformed `vec_gen_seq` đều để connection mở, khóa file DB trên Windows. Mọi failure phải rollback/close deterministically.
+- `init_db()` đã đóng connection deterministic, nhưng nhiều SQLite helper khác (gồm `upsert_file`) vẫn chưa dùng context manager/try-finally; OperationalError giữa mutation có thể để transaction/connection mở và khóa DB trên Windows. Mọi failure phải rollback/close deterministic.
 
 ### P1-20 — Model/context 33k chưa tự phát hiện/chọn được
 
@@ -176,7 +188,7 @@ Atomic clear, SQL scope filter, forced collection fence và generation guard cho
 Python và multi-project wording đã sửa. Còn:
 
 - Roadmap vẫn đánh dấu Phase 1–3 hoàn tất dù active tasks còn nhiều.
-- Tests section chưa phản ánh 72 tests và coverage multi-project/migration/vector mới.
+- Tests section chưa phản ánh 74 tests và coverage multi-project/migration/vector mới.
 - Bổ sung schema migration, degraded semantics, health, project lifecycle và giới hạn hiện tại.
 
 ### P2-23 — UI project/explorer
@@ -238,72 +250,79 @@ Lệnh kiểm tra tối thiểu:
 ## CLAUDE_REPORT — temporary handoff
 
 <!-- CLAUDE_REPORT_START -->
-## Vòng: atomic generation allocation + malformed/deterministic init repair (P0-10)
+## Vòng: Batch A / P0-10 — allocation + file mutation trong MỘT transaction IMMEDIATE
 
 ### Commit / working tree
-- Work commit: `4c8652b` (codemem/storage/db.py, tests/test_tombstones.py).
+- Work commit: `4c511b6` (codemem/storage/db.py, codemem/indexer/runner.py, tests/test_tombstones.py).
 - Report commit: chính commit chứa thay đổi workspace.md này.
 - Working tree sau report commit: clean (chỉ còn data/ gitignored). Không push.
 
 ### Task ID đã xử lý
-- **P0-10** — Codex repro: `_next_generation()` đọc `SELECT MAX(...)` ngoài write-transaction →
-  8 thread `upsert_file()` đồng thời trả `[1,1,1,1,2,2,2,2]` (gen tái sử dụng). INDEX_LOCK chỉ
-  serialize 1 process, không bảo vệ direct DB call / nhiều connection.
-- **P0-10** — Codex repro: `vec_gen_seq='broken'` → `int(...)` raise `ValueError` lúc startup;
-  connection `init_db()` không đóng → khóa file DB trên Windows.
+- **Batch A / P0-10** — Codex deterministic repro: `allocate_generation()` commit ở transaction
+  riêng TRƯỚC mutation của `upsert_file()`/`reserve_file_generation()`. Writer A nhận gen 1 rồi
+  pause; writer B nhận gen 2 và commit; A resume commit → DB còn `hash='older', vector_gen=1` dù
+  global seq=2 (generation/file state lùi, child rows bị writer cũ ghi đè).
 
 ### File / schema / API đã đổi
 - `codemem/storage/db.py`:
-  - **`allocate_generation()`** (thay `_next_generation`): dùng **connection riêng autocommit +
-    `BEGIN IMMEDIATE`** → giữ write-lock TRƯỚC khi `SELECT MAX` → read-modify-write atomic giữa các
-    connection/process. gen = `max(meta.vec_gen_seq, MAX(files.vector_gen), MAX(tombstones.generation)) + 1`.
-    `ROLLBACK` khi lỗi; connection luôn `close` (finally). `upsert_file` và `reserve_file_generation`
-    gọi hàm này (allocate trước, rồi mở conn ghi file).
-  - **`_safe_int(v, default=0)`**: parse int an toàn (meta malformed → default, không ValueError).
-    Dùng trong `allocate_generation` + repair invariant của init_db.
-  - `_conn()`: thêm `PRAGMA busy_timeout=5000` (chờ lock thay vì lỗi 'database is locked').
-  - `init_db()` tách thành `init_db()` (try/finally đóng conn) + `_init_db_impl(conn)` →
-    lỗi giữa migration vẫn đóng conn deterministic (chống khóa file DB trên Windows).
-  - Repair invariant: coi `vec_gen_seq` thiếu/thấp/**malformed** đều cần ghi lại từ max thực tế.
+  - **`_immediate_conn()`**: connection autocommit (`isolation_level=None`) + `busy_timeout=5000`
+    để tự quản lý `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK`.
+  - **`_alloc_gen_locked(conn)`**: tính + ghi gen trong transaction IMMEDIATE đã mở của caller
+    (không commit). `allocate_generation()` standalone wrap nó bằng `_immediate_conn` + BEGIN/COMMIT.
+  - **`upsert_file`** viết lại: `BEGIN IMMEDIATE` → `_alloc_gen_locked` → ghi
+    files + symbols + edges + routes + xóa overview → `COMMIT`, tất cả dưới MỘT write-lock; lỗi giữa
+    chừng → `ROLLBACK` (không consume gen, không ghi 1 phần); `finally` đóng conn. Hệ quả: hai writer
+    (cùng/khác file) KHÔNG interleave → writer gen thấp hoàn tất sau KHÔNG ghi đè state gen cao
+    (newest wins), child rows nằm trong cùng transaction.
+  - **`reserve_file_generation`** viết lại cùng kiểu (BEGIN IMMEDIATE bao cả alloc + UPDATE file).
+  - **`set_vector_ok_if_gen(path, project_id, generation, ok=True)`**: thêm tham số `ok` (set
+    vector_ok=0/1 chỉ khi gen còn khớp).
+- `codemem/indexer/runner.py`:
+  - `_index_one`: đổi `set_vector_ok(...)` → `set_vector_ok_if_gen(spath, pid, gen, vec_ok)` để
+    writer gen cũ hoàn tất sau KHÔNG ghi đè vector-state của gen mới (chính sách multi-process).
 - Không đổi schema/SCHEMA_VERSION; không thêm/đổi route.
 
 ### Lệnh test + kết quả
-- `PYTHONPATH=. PYTHONUTF8=1 python -m pytest tests -q` → **74 passed** (72 baseline + 2 mới).
-- Chạy lặp 5 lần 2 test mới (threading) → 5/5 pass (không flaky).
-- `python -m compileall -q codemem` → pass.
-- `node --check web/app.js` → pass.
+- `PYTHONPATH=. PYTHONUTF8=1 python -m pytest tests -q` → **77 passed** (74 baseline + 3 mới).
+- Chạy lặp 6 lần 4 test threading (same-file, reserve-vs-upsert, 8-writer, rollback) → 6/6 pass.
+- `python -m compileall -q codemem` → pass; `node --check web/app.js` → pass.
 - Test mới (tests/test_tombstones.py):
-  - `test_generation_unique_under_concurrency` — 8 thread (Barrier ép cùng lúc) `upsert_file` →
-    `len(set(gens))==8` và `max-min==7` (duy nhất, liên tục tăng).
-  - `test_init_repairs_malformed_generation_meta` — `vec_gen_seq='broken'` + file gen 40 →
-    `init_db` KHÔNG raise, repair `vec_gen_seq`→40, upsert sau đó gen>40.
+  - `test_upsert_same_file_concurrent_newest_gen_wins` — 2 writer cùng `/r/same.py` → gens `[1,2]`;
+    row cuối `vector_gen==2` và `hash==hash-<writer nhận gen 2>` (newest wins, gen không lùi).
+  - `test_upsert_rolls_back_on_failure` — symbol thiếu `kind` → `KeyError`; `vec_gen_seq` không tăng
+    (gen rollback), file lỗi vắng mặt, upsert kế tiếp `before+1` (DB không khóa).
+  - `test_reserve_and_upsert_concurrent_unique_gens` — reserve đua upsert → 2 gen duy nhất.
+  - (giữ `test_generation_unique_under_concurrency` 8-writer khác file, `test_init_repairs_malformed_generation_meta`.)
 
 ### Smoke / integration evidence (BẢN COPY data/code_index.db thật, non-destructive)
-- Set `vec_gen_seq='broken'` + re-init → KHÔNG raise; repair `vec_gen_seq`→93 (= MAX file gen).
-- 8 thread upsert đồng thời trên DB thật → gens `[94..101]`: unique=True, contiguous=True.
+- Same-file concurrent trên DB thật → gens `{A:96, B:97}`, winner B; row `hash-B`/`gen 97` → newest-wins OK.
+- Upsert lỗi (symbol thiếu key) → `vec_gen_seq` không đổi, file `bad.py` vắng mặt → rollback OK.
 - Bản copy đã xóa; DB thật không bị chạm.
 
-### Partial / còn thiếu (KHÔNG hoàn thành vòng này — vẫn mở trong ACTIVE TASKS)
-- **P0-10 — bounded timeout/cancel cho call Chroma đang treo** (Event chỉ dừng giữa các vòng;
-  call Chroma giữ INDEX_LOCK vẫn phải xong): CHƯA (mới có stuck-detection ở vòng trước).
-- **P0-10 — inventory/migration job đối chiếu DB↔Chroma cho mọi project + progress state**: CHƯA.
-- **P0-10 — integration test bằng Chroma THẬT** (missing-field + `$lte`, delete→recreate, summary
-  delete) + điều tra `$lte` >30s: CHƯA (vẫn fake/monkeypatch).
-- **P0-10 — smoke restart với Ollama LIVE** ghi metadata gen vào Chroma thật (9 vector thiếu
-  generation): CHƯA.
-- **P0-10 — backoff jitter/updated_at; UI pending/retry**: CHƯA.
-- **P0-5 — summary pending/version/reconcile state; retrieval kind `summary`; reconcile add lại
-  summary; collection generation theo embed-model/dimension**: CHƯA.
-- **P0-8 — files_new DDL recovery/ledger; migration version/ledger + backup/rollback**: CHƯA.
-  (Lưu ý: try/finally close vòng này đã xử lý phần "connection không đóng" mà P0-8/P1-19 nhắc tới,
-  nhưng ledger/rollback theo phase của files_new vẫn chưa làm.)
-- **P0-6 — re-check generation/project-existence sau INDEX_LOCK; summarizer trong lock**: CHƯA.
-- **P1-19 — FastAPI lifespan**: CHƯA.
+### Chính sách multi-process (nêu rõ theo acceptance)
+- SQLite: `BEGIN IMMEDIATE` + `busy_timeout` serialize generation+mutation **cross-process** (file lock
+  của SQLite). Newest-gen-wins đúng cả khi nhiều process ghi cùng file.
+- Vector: `_index_one` dùng `set_vector_ok_if_gen` (conditional theo gen) → writer/vector-write gen cũ
+  hoàn tất sau không lật vector-state của gen mới. CHƯA xử lý: vector ADD vào Chroma của gen cũ hoàn
+  tất sau gen mới (Chroma add không gated theo gen ở tầng ghi) — xem phần còn thiếu.
+
+### Partial / còn thiếu (KHÔNG hoàn thành vòng này — thuộc các Batch sau theo TASK DISTRIBUTION)
+- **Batch A còn lại / P0-10** — race ở tầng VECTOR write: nếu gen cũ và gen mới cùng ghi Chroma,
+  thứ tự `col.add` không được gated theo generation (chỉ vector_ok trong DB là conditional). Acceptance
+  Chroma-level thuộc Batch E (real-Chroma + ordering). Vòng này mới khóa chặt tầng SQLite + DB vector-state.
+- **Batch B / P0-6** — re-check generation/project-existence sau INDEX_LOCK; summarizer vào lock; tests
+  delete/switch khi callback/job đang chờ. CHƯA (batch kế).
+- **Batch C / P0-8** — versioned ledger, explicit transaction/recovery cho `files_new`, backup/rollback,
+  interrupted-phase tests. CHƯA.
+- **Batch D / P0-5+P0-10** — collection version theo embedding model, DB↔Chroma inventory/reconcile mọi
+  project + summary state. CHƯA.
+- **Batch E / P0-10** — real-Chroma integration (`$lte`, missing generation, delete→recreate),
+  timeout/cancel/process isolation, live restart smoke. CHƯA.
 
 ### Regression / phát hiện mới
-- Không phát hiện regression mới. 74/74 xanh (đã chạy lặp test threading 5 lần).
-- Lưu ý reviewer: `allocate_generation` mở connection riêng (autocommit) cho mỗi lần cấp gen
-  (1 BEGIN IMMEDIATE ngắn) → tách khỏi transaction ghi file của `upsert_file`. Hệ quả: gen được
-  commit TRƯỚC khi ghi file; nếu crash giữa, gen đó bị bỏ (monotonic vẫn đúng, không tái sử dụng).
-  `busy_timeout=5000` áp cho mọi `_conn()` nên các writer khác cũng chờ thay vì lỗi.
+- Không phát hiện regression mới. 77/77 xanh (threading test lặp 6 lần ổn định).
+- Lưu ý reviewer: chuyển sang `isolation_level=None` + BEGIN/COMMIT thủ công CHỈ áp cho 3 hàm
+  generation/upsert (qua `_immediate_conn`); các hàm khác vẫn dùng `_conn()` (đã thêm `busy_timeout`).
+  `upsert_file` lỗi giữa chừng rollback nên KHÔNG còn "consume gen rồi bỏ" như mô tả ở vòng trước —
+  monotonic vẫn đúng và không tạo gap.
 <!-- CLAUDE_REPORT_END -->
