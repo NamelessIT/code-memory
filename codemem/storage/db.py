@@ -156,10 +156,12 @@ def _init_db_impl(conn):
         conn.execute("DROP TABLE files")
         conn.execute("ALTER TABLE files_new RENAME TO files")
 
-    # Migrate du lieu single-project cu -> 1 project
+    # Migrate du lieu single-project cu -> 1 project. CHI khi co file project_id IS NULL (DB tien
+    # multi-project that su); file da co project_id nhung project mat la orphan -> de _repair_orphans
+    # xu ly (#P0-QR), khong tao 'legacy-project' gia.
     has_proj = conn.execute("SELECT COUNT(*) c FROM projects").fetchone()["c"]
-    nfiles = conn.execute("SELECT COUNT(*) c FROM files").fetchone()["c"]
-    if has_proj == 0 and nfiles > 0:
+    nfiles_null = conn.execute("SELECT COUNT(*) c FROM files WHERE project_id IS NULL").fetchone()["c"]
+    if has_proj == 0 and nfiles_null > 0:
         root_row = conn.execute("SELECT value FROM meta WHERE key='project_root'").fetchone()
         root = root_row["value"] if root_row else "legacy-project"
         now = datetime.now().isoformat()
@@ -212,12 +214,79 @@ def _init_db_impl(conn):
     if seq is None or seq != want:             # malformed/missing/thap -> ghi lai gia tri dung
         conn.execute("INSERT INTO meta(key,value) VALUES('vec_gen_seq',?) "
                      "ON CONFLICT(key) DO UPDATE SET value=?", (str(want), str(want)))
+
+    _repair_orphans(conn)                      # #P0-QR: project_id mo coi / active tro nham -> sua
     conn.commit()
 
 
 def _name_from_root(root):
     import os
     return os.path.basename(os.path.normpath(root)) or root
+
+
+def _common_root(paths):
+    """Suy root chung tu danh sach duong dan file (#P0-QR). None neu khong suy duoc (vd khac drive)."""
+    import os
+    dirs = [os.path.dirname(p) for p in paths if p]
+    dirs = [d for d in dirs if d]
+    if not dirs:
+        return None
+    try:
+        cr = os.path.commonpath(dirs)
+    except (ValueError, TypeError):
+        return None
+    return cr or None
+
+
+def _purge_project_data(conn, pid):
+    """Xoa du lieu cua project mo coi + ghi project-intent de don vector (#P0-QR)."""
+    for t in ("symbols", "edges", "routes", "files"):
+        conn.execute(f"DELETE FROM {t} WHERE project_id=?", (pid,))
+    conn.execute("DELETE FROM meta WHERE key=?", (f"overview:{pid}",))
+    add_tombstones_bulk(conn, [("project", pid, "", 0)])
+
+
+def _repair_orphans(conn):
+    """#P0-QR: phat hien & sua invariant hong de retrieval khong tra rong am tham:
+    - files/symbols/edges/routes mang project_id KHONG co trong projects;
+    - active_project_id tro toi project khong ton tai.
+    Sua deterministic: neu chi 1 orphan project_id va projects rong va suy duoc root chung tu file
+    paths -> recreate project (giu nguyen id) + set active; nguoc lai purge orphan + log (can re-index)."""
+    orphan_pids = [r["project_id"] for r in conn.execute(
+        "SELECT DISTINCT f.project_id AS project_id FROM files f "
+        "WHERE f.project_id IS NOT NULL AND NOT EXISTS "
+        "(SELECT 1 FROM projects p WHERE p.id=f.project_id)").fetchall()]
+    nproj = conn.execute("SELECT COUNT(*) c FROM projects").fetchone()["c"]
+    if orphan_pids:
+        if len(orphan_pids) == 1 and nproj == 0:
+            opid = orphan_pids[0]
+            paths = [r["path"] for r in conn.execute(
+                "SELECT path FROM files WHERE project_id=?", (opid,)).fetchall()]
+            root = _common_root(paths)
+            if root:
+                now = datetime.now().isoformat()
+                conn.execute("INSERT INTO projects(id,root,name,created_at,last_indexed_at) VALUES (?,?,?,?,?)",
+                             (opid, root, _name_from_root(root), now, now))
+                conn.execute("INSERT INTO meta(key,value) VALUES('active_project_id',?) "
+                             "ON CONFLICT(key) DO UPDATE SET value=?", (str(opid), str(opid)))
+                print(f"[repair] #P0-QR recreate orphan project {opid} root={root}")
+            else:
+                _purge_project_data(conn, opid)
+                print(f"[repair] #P0-QR purge orphan project {opid} (khong suy duoc root) -> can re-index")
+        else:
+            for opid in orphan_pids:
+                _purge_project_data(conn, opid)
+            print(f"[repair] #P0-QR purge orphan project_ids {orphan_pids} -> can re-index")
+    # active tro toi project khong ton tai -> chon project dau hoac xoa marker
+    act = conn.execute("SELECT value FROM meta WHERE key='active_project_id'").fetchone()
+    if act and act["value"]:
+        apid = _safe_int(act["value"], None)
+        if apid is None or conn.execute("SELECT 1 FROM projects WHERE id=?", (apid,)).fetchone() is None:
+            row = conn.execute("SELECT id FROM projects ORDER BY id LIMIT 1").fetchone()
+            if row:
+                conn.execute("UPDATE meta SET value=? WHERE key='active_project_id'", (str(row["id"]),))
+            else:
+                conn.execute("DELETE FROM meta WHERE key='active_project_id'")
 
 
 def _canon(root):
@@ -350,6 +419,22 @@ def project_exists(pid):
     ok = conn.execute("SELECT 1 FROM projects WHERE id=?", (pid,)).fetchone() is not None
     conn.close()
     return ok
+
+
+def integrity_status():
+    """#P0-QR: surface invariant cho /api/health. orphan_files>0 hoac active_valid=False -> retrieval
+    co the rong; init_db da tu repair, day la de quan sat/canh bao."""
+    conn = _conn()
+    orphan = conn.execute(
+        "SELECT COUNT(*) c FROM files f WHERE f.project_id IS NOT NULL AND NOT EXISTS "
+        "(SELECT 1 FROM projects p WHERE p.id=f.project_id)").fetchone()["c"]
+    act = conn.execute("SELECT value FROM meta WHERE key='active_project_id'").fetchone()
+    apid = _safe_int(act["value"], None) if act and act["value"] else None
+    active_valid = apid is not None and conn.execute(
+        "SELECT 1 FROM projects WHERE id=?", (apid,)).fetchone() is not None
+    nproj = conn.execute("SELECT COUNT(*) c FROM projects").fetchone()["c"]
+    conn.close()
+    return {"orphan_files": orphan, "active_valid": active_valid, "projects": nproj}
 
 
 def set_active_project(pid):
@@ -726,10 +811,12 @@ def search_symbols(keyword, limit=20, project_id=None):
     conn = _conn()
     pid = project_id if project_id is not None else _active_pid(conn)
     k = f"%{keyword}%"
+    # Corpus rong (#P0-QR): khop ca doc/body, khong chi name/signature -> tim duoc handler theo noi dung.
     rows = conn.execute(
-        "SELECT * FROM symbols WHERE project_id=? AND (name LIKE ? OR signature LIKE ?) "
+        "SELECT * FROM symbols WHERE project_id=? AND "
+        "(name LIKE ? OR signature LIKE ? OR doc LIKE ? OR body LIKE ?) "
         "ORDER BY exported DESC, length(name) ASC LIMIT ?",
-        (pid, k, k, limit),
+        (pid, k, k, k, k, limit),
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
@@ -740,6 +827,20 @@ def get_symbols_by_name(name, limit=10, project_id=None):
     pid = project_id if project_id is not None else _active_pid(conn)
     rows = conn.execute("SELECT * FROM symbols WHERE project_id=? AND name=? LIMIT ?",
                         (pid, name, limit)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def search_files(keyword, limit=10, project_id=None):
+    """Tim file theo path/skeleton/summary (#P0-QR): query khop ten file/import/summary nhung khong
+    co symbol name trung -> van keo duoc file lien quan."""
+    conn = _conn()
+    pid = project_id if project_id is not None else _active_pid(conn)
+    k = f"%{keyword}%"
+    rows = conn.execute(
+        "SELECT path, lang, skeleton, summary FROM files WHERE project_id=? AND "
+        "(path LIKE ? OR skeleton LIKE ? OR COALESCE(summary,'') LIKE ?) ORDER BY path LIMIT ?",
+        (pid, k, k, k, limit)).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
@@ -917,21 +1018,36 @@ def all_file_summaries(limit=400, project_id=None):
     return [dict(r) for r in rows]
 
 
-def summaries_revision(project_id=None, limit=400):
-    """Fingerprint on dinh cua tap summary dung de build overview (#P0-6). Doi khi file re-index
-    (summary bi xoa hoac vector_gen doi) hoac noi dung summary doi -> revision doi -> overview build
-    tu snapshot cu tro thanh stale, phai drop truoc set_overview."""
+def _revision_of(rows):
     import hashlib
+    h = hashlib.sha1()
+    for r in rows:
+        h.update(f"{r['path']}\x00{r['vector_gen']}\x00{r['summary']}\x00".encode("utf-8", "replace"))
+    return h.hexdigest()
+
+
+def all_file_summaries_with_revision(project_id=None, limit=400):
+    """Doc rows (path, summary) + fingerprint (path, vector_gen, summary) TRONG CUNG 1 query/connection
+    (#P0-6 atomic snapshot): tranh khe giua doc summaries va tinh revision khi co re-index xen vao.
+    build_overview build body tu chinh rows nay, commit chi khi revision hien tai van bang."""
     conn = _conn()
     pid = project_id if project_id is not None else _active_pid(conn)
     rows = conn.execute(
         "SELECT path, vector_gen, summary FROM files WHERE project_id=? AND COALESCE(summary,'')<>'' "
         "ORDER BY path LIMIT ?", (pid, limit)).fetchall()
     conn.close()
-    h = hashlib.sha1()
-    for r in rows:
-        h.update(f"{r['path']}\x00{r['vector_gen']}\x00{r['summary']}\x00".encode("utf-8", "replace"))
-    return h.hexdigest()
+    return [dict(r) for r in rows], _revision_of(rows)
+
+
+def summaries_revision(project_id=None, limit=400):
+    """Fingerprint hien tai cua tap summary (#P0-6) - dung de so voi snapshot truoc khi set_overview."""
+    conn = _conn()
+    pid = project_id if project_id is not None else _active_pid(conn)
+    rows = conn.execute(
+        "SELECT path, vector_gen, summary FROM files WHERE project_id=? AND COALESCE(summary,'')<>'' "
+        "ORDER BY path LIMIT ?", (pid, limit)).fetchall()
+    conn.close()
+    return _revision_of(rows)
 
 
 def summary_counts(project_id=None):

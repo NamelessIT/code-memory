@@ -58,6 +58,8 @@ IGNORE_DIRS = {
     ".git", "node_modules", "bin", "obj", "dist", "build", "out",
     ".venv", "venv", "env", "__pycache__", ".next", ".nuxt", "coverage",
     ".vs", ".idea", ".pytest_cache", ".mypy_cache", "site-packages",
+    # Cache/build generated cua FE framework -> tranh index ban sao .cache/page-ssr lam nhieu (#P0-QR)
+    ".cache", ".gatsby", ".astro", ".parcel-cache", ".turbo", ".vercel", ".svelte-kit",
 }
 
 MAX_FILE_BYTES = 1_500_000

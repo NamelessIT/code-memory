@@ -54,6 +54,7 @@ def health():
         "watcher": watcher.observer is not None,
         "cleanup": db.tombstone_stats(),    # pending/failed/last_error cleanup intent (#P0-10)
         "cleanup_scheduler": cleanup_scheduler_status(),  # running/busy/stuck (#P0-10)
+        "integrity": db.integrity_status(),  # orphan_files/active_valid/projects (#P0-QR)
     }
 
 

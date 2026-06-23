@@ -6,6 +6,7 @@ def _common(monkeypatch):
     monkeypatch.setattr(search.db, "active_project_id", lambda: 1)
     monkeypatch.setattr(search.db, "get_overview", lambda *a, **k: "")
     monkeypatch.setattr(search.db, "get_active_root", lambda: "/p")
+    monkeypatch.setattr(search.db, "search_files", lambda *a, **k: [])   # #P0-QR: corpus file-level
 
 
 def test_insufficient_evidence(monkeypatch):

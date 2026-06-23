@@ -53,10 +53,11 @@ def summarize_file(skeleton: str):
 
 
 def build_overview(project_id=None):
-    sums = db.all_file_summaries(limit=400, project_id=project_id)
+    # Atomic snapshot (#P0-6): rows + revision tu cung 1 query -> body va rev nhat quan, khong co khe
+    # giua doc summaries va tinh revision.
+    sums, rev = db.all_file_summaries_with_revision(limit=400, project_id=project_id)
     if not sums:
         return ""
-    rev = db.summaries_revision(project_id=project_id)   # snapshot truoc LLM (#P0-6)
     import os
     body = "\n".join(f"- {os.path.basename(s['path'])}: {s['summary']}" for s in sums)[:8000]
     ov = _ask(_OVERVIEW_SYS, f"Tóm tắt các file:\n{body}", max_ctx=NUM_CTX)   # LLM ngoai lock
